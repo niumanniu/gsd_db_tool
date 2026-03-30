@@ -56,21 +56,21 @@ func (o *OracleDriver) FetchMetadata(conn *Connection, schema string) (*Database
 
 	// 获取每个表的列、索引、约束
 	for _, table := range tables {
-		columns, err := o.fetchColumns(conn, table)
+		columns, err := o.fetchColumns(conn, table.Name)
 		if err != nil {
-			return nil, fmt.Errorf("获取表 %s 列信息失败：%w", table, err)
+			return nil, fmt.Errorf("获取表 %s 列信息失败：%w", table.Name, err)
 		}
 		meta.Columns[table.Name] = columns
 
-		indexes, err := o.fetchIndexes(conn, table)
+		indexes, err := o.fetchIndexes(conn, table.Name)
 		if err != nil {
-			return nil, fmt.Errorf("获取表 %s 索引信息失败：%w", table, err)
+			return nil, fmt.Errorf("获取表 %s 索引信息失败：%w", table.Name, err)
 		}
 		meta.Indexes[table.Name] = indexes
 
-		constraints, err := o.fetchConstraints(conn, table)
+		constraints, err := o.fetchConstraints(conn, table.Name)
 		if err != nil {
-			return nil, fmt.Errorf("获取表 %s 约束信息失败：%w", table, err)
+			return nil, fmt.Errorf("获取表 %s 约束信息失败：%w", table.Name, err)
 		}
 		meta.Constraints[table.Name] = constraints
 	}
