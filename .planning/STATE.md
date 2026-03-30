@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Oracle Support
 current_phase: 4
-status: Milestone complete
-last_updated: "2026-03-30T13:40:00.000Z"
+status: Shipped — PR #1 created
+last_updated: "2026-03-30"
 progress:
   total_phases: 4
   completed_phases: 4
