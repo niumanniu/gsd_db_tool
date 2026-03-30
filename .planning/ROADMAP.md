@@ -66,7 +66,7 @@
 
 **Success Criteria:** ✓ All met
 
-**Plans:** 3/3 complete
+**Plans:** 3/3 plans complete
 - [x] 04-01-PLAN.md — 驱动抽象层、MySQL 驱动、Oracle 驱动、Config 扩展
 - [x] 04-02-PLAN.md — CLI 参数、类型映射模块、Comparator 集成
 - [x] 04-03-PLAN.md — 报告类型警告显示、E2E 验证
