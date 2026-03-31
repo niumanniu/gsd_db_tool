@@ -23,7 +23,8 @@ type Driver interface {
 
 // Connection 数据库连接
 type Connection struct {
-	DB *sql.DB
+	DB         *sql.DB
+	DriverName string // 驱动名称："mysql" 或 "oracle"
 }
 
 // Close 关闭连接

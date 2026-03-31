@@ -20,18 +20,23 @@ const (
 
 // CompareOptions 对比选项
 type CompareOptions struct {
-	Mode        DataMode `yaml:"mode"`              // 对比模式：structure|data
-	DataMode    DataMode `yaml:"data_mode"`         // 数据对比模式：count|full|sample
-	SampleRatio float64  `yaml:"sample_ratio"`      // 抽样比例 (0.0-1.0)
-	SampleSize  int      `yaml:"sample_size"`       // 抽样数量
-	Tables      []string `yaml:"tables"`            // 指定表列表，空表示所有表
+	Mode            DataMode `yaml:"mode"`              // 对比模式：structure|data
+	DataMode        DataMode `yaml:"data_mode"`         // 数据对比模式：count|full|sample
+	SampleRatio     float64  `yaml:"sample_ratio"`      // 抽样比例 (0.0-1.0)
+	SampleSize      int      `yaml:"sample_size"`       // 抽样数量
+	Tables          []string `yaml:"tables"`            // 指定表列表，空表示所有表
+	IncludeColumns  []string `yaml:"include_columns"`   // 只比对的字段列表，空表示所有字段
+	ExcludeColumns  []string `yaml:"exclude_columns"`   // 跳过比对的字段列表
+	HashFilter      bool     `yaml:"hash_filter"`       // 是否启用 hash 预筛选（提高大宽表性能）
+	ShowFullData    bool     `yaml:"show_full_data"`    // 是否显示完整数据（源数据和目标数据）
+	ShowProgress    bool     `yaml:"show_progress"`     // 是否显示进度和耗时
 }
 
 // Config 数据库对比配置
 type Config struct {
-	Source       Database     `yaml:"source"`
-	Target       Database     `yaml:"target"`
-	CompareOptions `yaml:"compare_options"`
+    Source       Database       `yaml:"source"`
+    Target       Database       `yaml:"target"`
+    CompareOptions CompareOptions `yaml:"compare_options"`
 }
 
 // Database 数据库连接配置
@@ -141,15 +146,15 @@ func (c *Config) Validate() error {
 	if c.Target.Driver == "" {
 		c.Target.Driver = "mysql" // 默认 mysql
 	}
-	if c.DataMode == "" {
-		c.DataMode = DataModeCount // 默认只对比记录数
+	if c.CompareOptions.DataMode == "" {
+		c.CompareOptions.DataMode = DataModeCount // 默认只对比记录数
 	}
-	if c.DataMode != DataModeCount && c.DataMode != DataModeFull && c.DataMode != DataModeSample {
-		return fmt.Errorf("无效的数据对比模式：%s", c.DataMode)
+	if c.CompareOptions.DataMode != DataModeCount && c.CompareOptions.DataMode != DataModeFull && c.CompareOptions.DataMode != DataModeSample {
+		return fmt.Errorf("无效的数据对比模式：%s", c.CompareOptions.DataMode)
 	}
-	if c.DataMode == DataModeSample {
-		if c.SampleRatio <= 0 || c.SampleRatio > 1 {
-			c.SampleRatio = 0.1 // 默认 10% 抽样
+	if c.CompareOptions.DataMode == DataModeSample {
+		if c.CompareOptions.SampleRatio <= 0 || c.CompareOptions.SampleRatio > 1 {
+			c.CompareOptions.SampleRatio = 0.1 // 默认 10% 抽样
 		}
 	}
 	return nil

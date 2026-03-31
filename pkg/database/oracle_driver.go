@@ -30,7 +30,7 @@ func (o *OracleDriver) Connect(cfg config.Database) (*Connection, error) {
 		return nil, fmt.Errorf("连接数据库失败：%w", err)
 	}
 
-	return &Connection{DB: db}, nil
+	return &Connection{DB: db, DriverName: "oracle"}, nil
 }
 
 // buildDSN 构建 Oracle DSN 连接字符串

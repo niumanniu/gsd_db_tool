@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"db-diff/pkg/config"
 
@@ -24,7 +25,7 @@ func (m *MySQLDriver) Connect(cfg config.Database) (*Connection, error) {
 		return nil, fmt.Errorf("连接数据库失败：%w", err)
 	}
 
-	return &Connection{DB: db}, nil
+	return &Connection{DB: db, DriverName: "mysql"}, nil
 }
 
 // FetchMetadata 获取 MySQL 数据库元数据
@@ -112,6 +113,89 @@ func (m *MySQLDriver) FetchData(conn *Connection, table string, columns []Column
 	return data, rows.Err()
 }
 
+// FetchDataWithHash 获取 MySQL 表数据（带 SQL 层 hash 计算）
+// hashColumns 指定用于计算 hash 的列，如果为空则使用所有列
+func (m *MySQLDriver) FetchDataWithHash(conn *Connection, table string, columns []ColumnMeta, hashColumns []ColumnMeta, pkCol string, startKey interface{}, limit int) ([]map[string]interface{}, []interface{}, error) {
+	// 构建 hash 表达式：MD5(CONCAT(IFNULL(col1,''),';',IFNULL(col2,''),...))
+	hashExpr := "MD5(CONCAT("
+	for i, c := range hashColumns {
+		if i > 0 {
+			hashExpr += ",'"
+		}
+		// 处理不同类型
+		switch c.DataType {
+		case "int", "integer", "bigint", "smallint", "tinyint", "mediumint":
+			hashExpr += fmt.Sprintf("IFNULL(`%s`,'')", c.Name)
+		case "decimal", "numeric", "float", "double":
+			hashExpr += fmt.Sprintf("IFNULL(CAST(`%s` AS CHAR),'')", c.Name)
+		case "datetime", "timestamp", "date", "time":
+			hashExpr += fmt.Sprintf("IFNULL(DATE_FORMAT(`%s`,'%%Y-%%m-%%d %%H:%%i:%%s'),'')", c.Name)
+		default:
+			hashExpr += fmt.Sprintf("IFNULL(`%s`,'')", c.Name)
+		}
+	}
+	hashExpr += "))) AS row_hash"
+
+	// 构建 SELECT 子句
+	colNames := make([]string, len(columns))
+	for i, c := range columns {
+		colNames[i] = fmt.Sprintf("`%s`", c.Name)
+	}
+	selectClause := fmt.Sprintf("%s, %s", strings.Join(colNames, ", "), hashExpr)
+
+	// 构建查询
+	whereClause := ""
+	args := []interface{}{}
+	if startKey != nil {
+		whereClause = fmt.Sprintf("WHERE `%s` >= ?", pkCol)
+		args = append(args, startKey)
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM `%s` %s ORDER BY `%s` LIMIT ?", selectClause, table, whereClause, pkCol)
+	args = append(args, limit+1) // 多取一行用于判断是否有下一页
+
+	rows, err := conn.DB.Query(query, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	// 获取列名（包含 row_hash）
+	cols, _ := rows.Columns()
+	values := make([]interface{}, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var data []map[string]interface{}
+	var nextKey []interface{}
+	count := 0
+
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, nil, err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			if col == "row_hash" {
+				// 将 hash 值存入特殊字段
+				row["__row_hash__"] = values[i]
+			} else {
+				row[col] = values[i]
+			}
+		}
+		if count < limit {
+			data = append(data, row)
+		} else {
+			nextKey = []interface{}{row[pkCol]}
+		}
+		count++
+	}
+
+	return data, nextKey, rows.Err()
+}
+
 // fetchTables 获取 MySQL 表列表
 func (m *MySQLDriver) fetchTables(conn *Connection, schema string) ([]TableMeta, error) {
 	query := `
@@ -153,6 +237,25 @@ func (m *MySQLDriver) fetchColumns(conn *Connection, schema, table string) ([]Co
 	}
 	defer rows.Close()
 
+	// 获取主键列信息
+	pkCols := make(map[string]bool)
+	pkQuery := `
+		SELECT COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY'
+	`
+	pkRows, err := conn.DB.Query(pkQuery, schema, table)
+	if err == nil {
+		defer pkRows.Close()
+		for pkRows.Next() {
+			var colName string
+			if err := pkRows.Scan(&colName); err != nil {
+				continue
+			}
+			pkCols[colName] = true
+		}
+	}
+
 	var columns []ColumnMeta
 	for rows.Next() {
 		var col ColumnMeta
@@ -164,6 +267,7 @@ func (m *MySQLDriver) fetchColumns(conn *Connection, schema, table string) ([]Co
 		); err != nil {
 			return nil, err
 		}
+		col.IsPrimaryKey = pkCols[col.Name]
 		columns = append(columns, col)
 	}
 	return columns, rows.Err()

@@ -9,7 +9,7 @@ import (
 )
 
 // GenerateText 生成文本格式报告
-func GenerateText(result *comparator.DiffResult, outputFile string, verbose bool) error {
+func GenerateText(result *comparator.DiffResult, outputFile string, verbose bool, showFullData bool) error {
 	var out io.Writer = os.Stdout
 
 	if outputFile != "" {
@@ -21,13 +21,61 @@ func GenerateText(result *comparator.DiffResult, outputFile string, verbose bool
 		out = f
 	}
 
+	// 判断是否有结构差异和数据差异
+	hasStructDiff := len(result.TableDiff.Added) > 0 || len(result.TableDiff.Missing) > 0
+	for _, diff := range result.ColumnDiff {
+		if len(diff.Added) > 0 || len(diff.Removed) > 0 || len(diff.Modified) > 0 {
+			hasStructDiff = true
+			break
+		}
+	}
+	for _, diff := range result.IndexDiff {
+		if len(diff.Added) > 0 || len(diff.Removed) > 0 || len(diff.Modified) > 0 {
+			hasStructDiff = true
+			break
+		}
+	}
+	for _, diff := range result.ConstraintDiff {
+		if len(diff.Added) > 0 || len(diff.Removed) > 0 || len(diff.Modified) > 0 {
+			hasStructDiff = true
+			break
+		}
+	}
+
+	hasDataDiff := false
+	for _, diff := range result.TableDataDiff {
+		if len(diff.Added) > 0 || len(diff.Removed) > 0 || len(diff.Modified) > 0 {
+			hasDataDiff = true
+			break
+		}
+	}
+
+	hasCountDiff := false
+	for _, count := range result.TableCounts {
+		if count.Diff != 0 {
+			hasCountDiff = true
+			break
+		}
+	}
+
+	// 根据对比内容动态显示标题
 	fmt.Fprintln(out, "========================================")
-	fmt.Fprintln(out, "   数据库结构对比报告")
+	if hasStructDiff && hasDataDiff {
+		fmt.Fprintln(out, "   数据库结构与数据对比报告")
+	} else if hasDataDiff || hasCountDiff {
+		fmt.Fprintln(out, "   数据库数据对比报告")
+	} else {
+		fmt.Fprintln(out, "   数据库结构对比报告")
+	}
 	fmt.Fprintln(out, "========================================")
 	fmt.Fprintf(out, "源数据库：%s\n", result.SourceSchema)
 	fmt.Fprintf(out, "目标数据库：%s\n\n", result.TargetSchema)
-	fmt.Fprintln(out, "图例：[相同] [已映射匹配] [类型不兼容]")
-	fmt.Fprintln(out)
+
+	// 只显示结构对比相关的图例
+	if hasStructDiff {
+		fmt.Fprintln(out, "图例：[相同] [已映射匹配] [类型不兼容]")
+		fmt.Fprintln(out)
+	}
 
 	// 表差异摘要
 	printTableDiff(out, result.TableDiff)
@@ -92,25 +140,25 @@ func GenerateText(result *comparator.DiffResult, outputFile string, verbose bool
 		}
 	}
 
-	// 数据差异
-	hasDataDiff := false
+	// 详细数据差异（非 count 模式）
+	detailedDataDiff := false
 	for table, diff := range result.TableDataDiff {
 		if len(diff.Added) > 0 || len(diff.Removed) > 0 || len(diff.Modified) > 0 {
-			if !hasDataDiff {
+			if !detailedDataDiff {
 				fmt.Fprintln(out, "\n----------------------------------------")
 				fmt.Fprintln(out, "数据差异:")
-				hasDataDiff = true
+				detailedDataDiff = true
 			}
 			fmt.Fprintf(out, "\n【表：%s】\n", table)
-			printDataDiff(out, diff, verbose)
+			printDataDiff(out, diff, verbose, showFullData)
 		}
 	}
 
 	// 总结
 	fmt.Fprintln(out, "\n========================================")
 	fmt.Fprintln(out, "对比完成")
-	if !hasColumnDiff && !hasIndexDiff && !hasConstraintDiff && !hasDataDiff &&
-		len(result.TableDiff.Added) == 0 && len(result.TableDiff.Missing) == 0 {
+	if !hasColumnDiff && !hasIndexDiff && !hasConstraintDiff && !detailedDataDiff &&
+		!hasCountDiff && len(result.TableDiff.Added) == 0 && len(result.TableDiff.Missing) == 0 {
 		fmt.Fprintln(out, "✓ 两个数据库完全一致")
 	} else {
 		fmt.Fprintln(out, "✗ 发现差异")
@@ -231,7 +279,7 @@ func printConstraintDiff(out io.Writer, diff comparator.ConstraintDiff, verbose 
 	}
 }
 
-func printDataDiff(out io.Writer, diff comparator.DataDiff, verbose bool) {
+func printDataDiff(out io.Writer, diff comparator.DataDiff, verbose bool, showFullData bool) {
 	if len(diff.Added) > 0 {
 		fmt.Fprintf(out, "  + 新增行 (%d):\n", len(diff.Added))
 		for i, row := range diff.Added {
@@ -239,11 +287,10 @@ func printDataDiff(out io.Writer, diff comparator.DataDiff, verbose bool) {
 				fmt.Fprintf(out, "    ... 还有 %d 行\n", len(diff.Added)-10)
 				break
 			}
-			fmt.Fprintf(out, "    • 主键=%v\n", row["id"])
-			if verbose {
-				for k, v := range row {
-					fmt.Fprintf(out, "      %s: %v\n", k, v)
-				}
+			fmt.Fprintf(out, "    • 行 %d:\n", i+1)
+			for k, v := range row {
+				valStr := formatValue(v)
+				fmt.Fprintf(out, "        %s: %s\n", k, valStr)
 			}
 		}
 	}
@@ -254,11 +301,10 @@ func printDataDiff(out io.Writer, diff comparator.DataDiff, verbose bool) {
 				fmt.Fprintf(out, "    ... 还有 %d 行\n", len(diff.Removed)-10)
 				break
 			}
-			fmt.Fprintf(out, "    • 主键=%v\n", row["id"])
-			if verbose {
-				for k, v := range row {
-					fmt.Fprintf(out, "      %s: %v\n", k, v)
-				}
+			fmt.Fprintf(out, "    • 行 %d:\n", i+1)
+			for k, v := range row {
+				valStr := formatValue(v)
+				fmt.Fprintf(out, "        %s: %s\n", k, valStr)
 			}
 		}
 	}
@@ -273,6 +319,70 @@ func printDataDiff(out io.Writer, diff comparator.DataDiff, verbose bool) {
 			for _, change := range mod.Changes {
 				fmt.Fprintf(out, "      %s\n", change)
 			}
+			// 根据配置显示完整数据
+			if showFullData {
+				fmt.Fprintln(out, "      源数据:")
+				for k, v := range mod.Source {
+					valStr := formatValue(v)
+					fmt.Fprintf(out, "        %s: %s\n", k, valStr)
+				}
+				fmt.Fprintln(out, "      目标数据:")
+				for k, v := range mod.Target {
+					valStr := formatValue(v)
+					fmt.Fprintf(out, "        %s: %s\n", k, valStr)
+				}
+			}
 		}
 	}
+}
+
+// formatValue 格式化字段值，处理二进制和特殊类型
+func formatValue(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch val := v.(type) {
+	case []byte:
+		// 尝试转为字符串
+		str := string(val)
+		// 如果是纯数字字符串，直接显示
+		if isNumeric(str) {
+			return str
+		}
+		// 如果是可打印字符串，直接显示
+		if isPrintable(str) {
+			if len(str) > 100 {
+				return str[:100] + "..."
+			}
+			return str
+		}
+		return fmt.Sprintf("[binary %d bytes]", len(val))
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
+// isNumeric 检查字符串是否为纯数字
+func isNumeric(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			if r != '.' && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isPrintable 检查字符串是否为可打印字符
+func isPrintable(s string) bool {
+	for _, r := range s {
+		if r < 32 && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
 }

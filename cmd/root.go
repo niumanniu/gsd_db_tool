@@ -22,6 +22,13 @@ var (
 	sampleRatio float64
 	tablesFlag  string
 
+	// 数据对比优化选项
+	includeColumns string
+	excludeColumns string
+	hashFilter     bool
+	showFullData   bool
+	showProgress   bool
+
 	// Driver and schema flags for cross-database support
 	sourceDriver string
 	targetDriver string
@@ -51,6 +58,13 @@ func init() {
 	rootCmd.Flags().Float64VarP(&sampleRatio, "sample-ratio", "r", 0.1, "抽样比例 (0.0-1.0)")
 	rootCmd.Flags().StringVarP(&tablesFlag, "tables", "T", "", "指定表列表，逗号分隔")
 
+	// 数据对比优化选项
+	rootCmd.Flags().StringVar(&includeColumns, "include-columns", "", "只比对的字段列表，逗号分隔")
+	rootCmd.Flags().StringVar(&excludeColumns, "exclude-columns", "", "跳过比对的字段列表，逗号分隔")
+	rootCmd.Flags().BoolVar(&hashFilter, "hash-filter", false, "启用 hash 预筛选（提高大宽表性能）")
+	rootCmd.Flags().BoolVar(&showFullData, "show-full-data", false, "显示完整数据（源数据和目标数据）")
+	rootCmd.Flags().BoolVar(&showProgress, "show-progress", false, "显示进度和耗时")
+
 	// Cross-database support flags
 	rootCmd.Flags().StringVar(&sourceDriver, "source-driver", "mysql", "源数据库驱动 (mysql|oracle)")
 	rootCmd.Flags().StringVar(&targetDriver, "target-driver", "mysql", "目标数据库驱动 (mysql|oracle)")
@@ -65,19 +79,42 @@ func runDiff(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("加载配置失败：%w", err)
 	}
 
-	// 命令行参数覆盖
-	if dataMode != "" {
-		cfg.DataMode = config.DataMode(dataMode)
+	// 命令行参数覆盖（只有当用户实际指定参数时才覆盖）
+	if cmd.Flags().Changed("data-mode") {
+		cfg.CompareOptions.DataMode = config.DataMode(dataMode)
 	}
-	if sampleRatio > 0 {
-		cfg.SampleRatio = sampleRatio
+	if cmd.Flags().Changed("sample-ratio") {
+		cfg.CompareOptions.SampleRatio = sampleRatio
 	}
-	if tablesFlag != "" {
+	if cmd.Flags().Changed("tables") {
 		// 解析逗号分隔的表名列表
-		cfg.Tables = strings.Split(tablesFlag, ",")
-		for i, t := range cfg.Tables {
-			cfg.Tables[i] = strings.TrimSpace(t)
+		cfg.CompareOptions.Tables = strings.Split(tablesFlag, ",")
+		for i, t := range cfg.CompareOptions.Tables {
+			cfg.CompareOptions.Tables[i] = strings.TrimSpace(t)
 		}
+	}
+	if cmd.Flags().Changed("include-columns") {
+		// 解析逗号分隔的字段列表
+		cfg.CompareOptions.IncludeColumns = strings.Split(includeColumns, ",")
+		for i, c := range cfg.CompareOptions.IncludeColumns {
+			cfg.CompareOptions.IncludeColumns[i] = strings.TrimSpace(c)
+		}
+	}
+	if cmd.Flags().Changed("exclude-columns") {
+		// 解析逗号分隔的字段列表
+		cfg.CompareOptions.ExcludeColumns = strings.Split(excludeColumns, ",")
+		for i, c := range cfg.CompareOptions.ExcludeColumns {
+			cfg.CompareOptions.ExcludeColumns[i] = strings.TrimSpace(c)
+		}
+	}
+	if cmd.Flags().Changed("hash-filter") {
+		cfg.CompareOptions.HashFilter = hashFilter
+	}
+	if cmd.Flags().Changed("show-full-data") {
+		cfg.CompareOptions.ShowFullData = showFullData
+	}
+	if cmd.Flags().Changed("show-progress") {
+		cfg.CompareOptions.ShowProgress = showProgress
 	}
 
 	// Driver and schema parameters (command line takes precedence)
@@ -112,7 +149,7 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	case "text":
 		fallthrough
 	default:
-		return report.GenerateText(result, outputFile, verbose)
+		return report.GenerateText(result, outputFile, verbose, cfg.CompareOptions.ShowFullData)
 	}
 }
 

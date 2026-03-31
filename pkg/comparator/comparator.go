@@ -4,6 +4,8 @@ import (
 	"db-diff/pkg/config"
 	"db-diff/pkg/database"
 	"fmt"
+	"strings"
+	"time"
 )
 
 // getDriver 根据 driver 名称获取驱动实例
@@ -140,7 +142,16 @@ func Compare(cfg *config.Config) (*DiffResult, error) {
 	}
 	defer targetConn.Close()
 
-	// 获取元数据（使用 GetSchema() 获取 schema）
+	// 确定是否执行结构对比和/或数据对比
+	// mode 为空或 structure 时只做结构对比
+	// mode 为 data 时只做数据对比
+	// mode 为 all 时两者都做
+	// dataMode 有值时也执行数据对比（命令行覆盖）
+	mode := cfg.CompareOptions.Mode
+	doStructure := mode == "" || mode == "structure" || mode == "all"
+	doData := mode == "data" || mode == "all" || (cfg.CompareOptions.DataMode != "" && cfg.CompareOptions.DataMode != "count")
+
+	// 获取元数据（结构对比或数据对比都需要）
 	sourceMeta, err := sourceDriver.FetchMetadata(sourceConn, cfg.Source.GetSchema())
 	if err != nil {
 		return nil, fmt.Errorf("获取源数据库元数据失败：%w", err)
@@ -151,16 +162,13 @@ func Compare(cfg *config.Config) (*DiffResult, error) {
 		return nil, fmt.Errorf("获取目标数据库元数据失败：%w", err)
 	}
 
-	// 对比表
-	result.TableDiff = compareTables(sourceMeta.Tables, targetMeta.Tables)
-
-	// 获取共同表（只对比两个库都存在的表）
+	// 获取共同表
 	commonTables := getCommonTables(sourceMeta.Tables, targetMeta.Tables)
 
 	// 过滤指定表
-	if len(cfg.Tables) > 0 {
+	if len(cfg.CompareOptions.Tables) > 0 {
 		tableSet := make(map[string]bool)
-		for _, t := range cfg.Tables {
+		for _, t := range cfg.CompareOptions.Tables {
 			tableSet[t] = true
 		}
 		filtered := []string{}
@@ -172,34 +180,44 @@ func Compare(cfg *config.Config) (*DiffResult, error) {
 		commonTables = filtered
 	}
 
-	// 对比每个表的结构
-	for _, table := range commonTables {
-		result.ColumnDiff[table] = compareColumns(
-			sourceMeta.Columns[table],
-			targetMeta.Columns[table],
-			cfg.Source.Driver,
-			cfg.Target.Driver,
-		)
-		result.IndexDiff[table] = compareIndexes(
-			sourceMeta.Indexes[table],
-			targetMeta.Indexes[table],
-		)
-		result.ConstraintDiff[table] = compareConstraints(
-			sourceMeta.Constraints[table],
-			targetMeta.Constraints[table],
-		)
+	// 结构对比
+	if doStructure {
+		// 对比表
+		result.TableDiff = compareTables(sourceMeta.Tables, targetMeta.Tables)
+
+		// 对比每个表的结构
+		for _, table := range commonTables {
+			result.ColumnDiff[table] = compareColumns(
+				sourceMeta.Columns[table],
+				targetMeta.Columns[table],
+				cfg.Source.Driver,
+				cfg.Target.Driver,
+			)
+			result.IndexDiff[table] = compareIndexes(
+				sourceMeta.Indexes[table],
+				targetMeta.Indexes[table],
+			)
+			result.ConstraintDiff[table] = compareConstraints(
+				sourceMeta.Constraints[table],
+				targetMeta.Constraints[table],
+			)
+		}
 	}
 
 	// 数据对比
-	if cfg.DataMode != "" {
+	if doData {
 		for _, table := range commonTables {
-			switch cfg.DataMode {
-			case config.DataModeCount:
-				result.TableCounts[table], _ = compareTableCount(sourceConn, targetConn, table)
+			cols := sourceMeta.Columns[table]
+
+			switch cfg.CompareOptions.DataMode {
 			case config.DataModeFull:
-				result.TableDataDiff[table], _ = compareTableDataFull(sourceConn, targetConn, table, sourceMeta.Columns[table])
+				result.TableDataDiff[table], _ = compareTableDataFull(sourceConn, targetConn, table, cols, &cfg.CompareOptions)
 			case config.DataModeSample:
-				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cfg.SampleRatio, sourceMeta.Columns[table])
+				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cfg.CompareOptions.SampleRatio, cols)
+			default:
+				// 默认只对比记录数
+				count, _ := compareTableCount(sourceConn, targetConn, table)
+				result.TableCounts[table] = count
 			}
 		}
 	}
@@ -451,69 +469,439 @@ func compareTableCount(sourceConn, targetConn *database.Connection, table string
 	return count, nil
 }
 
-// compareTableDataFull 全量数据对比
-func compareTableDataFull(sourceConn, targetConn *database.Connection, table string, columns []database.ColumnMeta) (DataDiff, error) {
+// compareTableDataFull 全量数据对比（主键范围 + 分批，降低内存占用）
+func compareTableDataFull(sourceConn, targetConn *database.Connection, table string, columns []database.ColumnMeta, cfg *config.CompareOptions) (DataDiff, error) {
 	var diff DataDiff
+	startTime := time.Now()
 
 	// 获取主键列
 	pkCols := getPrimaryKeyColumns(columns)
 	if len(pkCols) == 0 {
-		// 没有主键，使用所有列
-		for _, c := range columns {
-			pkCols = append(pkCols, c.Name)
+		return diff, fmt.Errorf("表 %s 没有主键或唯一索引，无法进行全量数据对比", table)
+	}
+
+	// 处理列过滤：include 和 exclude
+	filteredCols := filterColumns(columns, cfg.IncludeColumns, cfg.ExcludeColumns)
+	if len(filteredCols) == 0 {
+		return diff, fmt.Errorf("表 %s 没有可对比的字段（可能被全部排除）", table)
+	}
+
+	const batchSize = 1000
+	pkColName := pkCols[0]
+
+	// 获取源表主键范围
+	sourceMinMax := getPrimaryKeyRange(sourceConn, table, pkColName)
+	targetMinMax := getPrimaryKeyRange(targetConn, table, pkColName)
+
+	// 处理空表情况
+	if sourceMinMax.Count == 0 && targetMinMax.Count == 0 {
+		if cfg.ShowProgress {
+			fmt.Printf("\r[%s] 比对完成，耗时 %v\n", table, time.Since(startTime))
 		}
+		return diff, nil
 	}
-
-	// 读取源表数据
-	sourceData, err := fetchTableData(sourceConn, table, columns)
-	if err != nil {
-		return diff, err
-	}
-
-	// 读取目标表数据
-	targetData, err := fetchTableData(targetConn, table, columns)
-	if err != nil {
-		return diff, err
-	}
-
-	// 构建主键索引
-	sourceMap := make(map[string]map[string]interface{})
-	targetMap := make(map[string]map[string]interface{})
-
-	for _, row := range sourceData {
-		key := buildKey(row, pkCols)
-		sourceMap[key] = row
-	}
-	for _, row := range targetData {
-		key := buildKey(row, pkCols)
-		targetMap[key] = row
-	}
-
-	// 查找差异
-	for key, srcRow := range sourceMap {
-		if tgtRow, exists := targetMap[key]; exists {
-			// 检查是否有修改
-			changes := compareRow(srcRow, tgtRow, columns)
-			if len(changes) > 0 {
-				diff.Modified = append(diff.Modified, DataModification{
-					Key:     key,
-					Source:  srcRow,
-					Target:  tgtRow,
-					Changes: changes,
-				})
+	if sourceMinMax.Count == 0 {
+		for {
+			batch, _, err := fetchDataByKeyRange(targetConn, table, columns, pkCols, []interface{}{targetMinMax.MinVal}, batchSize)
+			if err != nil {
+				return diff, err
 			}
+			for _, row := range batch {
+				diff.Added = append(diff.Added, row)
+			}
+			if len(batch) < batchSize {
+				break
+			}
+		}
+		if cfg.ShowProgress {
+			fmt.Printf("\r[%s] 比对完成，耗时 %v\n", table, time.Since(startTime))
+		}
+		return diff, nil
+	}
+	if targetMinMax.Count == 0 {
+		for {
+			batch, _, err := fetchDataByKeyRange(sourceConn, table, columns, pkCols, []interface{}{sourceMinMax.MinVal}, batchSize)
+			if err != nil {
+				return diff, err
+			}
+			for _, row := range batch {
+				diff.Removed = append(diff.Removed, row)
+			}
+			if len(batch) < batchSize {
+				break
+			}
+		}
+		if cfg.ShowProgress {
+			fmt.Printf("\r[%s] 比对完成，耗时 %v\n", table, time.Since(startTime))
+		}
+		return diff, nil
+	}
+
+	// 按主键范围分批对比
+	currentKey := sourceMinMax.MinVal
+	if sourceMinMax.MinVal == nil {
+		currentKey = targetMinMax.MinVal
+	}
+
+	// 进度追踪
+	totalCount := sourceMinMax.Count
+	if targetMinMax.Count > totalCount {
+		totalCount = targetMinMax.Count
+	}
+	processedCount := 0
+
+	if cfg.ShowProgress {
+		fmt.Printf("\n[%s] 开始比对，共 %d 条记录...\n", table, totalCount)
+	}
+
+	for {
+		var sourceBatch, targetBatch []map[string]interface{}
+		var sourceNext, targetNext []interface{}
+		var sourceBatchHash, targetBatchHash string
+		var err error
+
+		// 根据 HashFilter 配置选择读取方式
+		if cfg.HashFilter {
+			// 使用 SQL 层 hash 计算（仅支持 MySQL）
+			if sourceConn.DriverName == "mysql" {
+				sourceBatch, sourceNext, sourceBatchHash, err = fetchMySQLDataWithHash(
+					sourceConn, table, columns, filteredCols, pkColName, currentKey, batchSize)
+				if err != nil {
+					return diff, fmt.Errorf("读取源表数据（带 hash）失败：%w", err)
+				}
+			} else {
+				// Oracle 退化为应用层 hash（不支持批聚合 hash）
+				sourceBatch, sourceNext, err = fetchDataByKeyRange(sourceConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+				if err != nil {
+					return diff, fmt.Errorf("读取源表数据失败：%w", err)
+				}
+			}
+			if targetConn.DriverName == "mysql" {
+				targetBatch, targetNext, targetBatchHash, err = fetchMySQLDataWithHash(
+					targetConn, table, columns, filteredCols, pkColName, currentKey, batchSize)
+				if err != nil {
+					return diff, fmt.Errorf("读取目标表数据（带 hash）失败：%w", err)
+				}
+			} else {
+				// Oracle 退化为应用层 hash（不支持批聚合 hash）
+				targetBatch, targetNext, err = fetchDataByKeyRange(targetConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+				if err != nil {
+					return diff, fmt.Errorf("读取目标表数据失败：%w", err)
+				}
+			}
+
+			// 如果整批数据的聚合 hash 相同，且批大小相同，则跳过整批
+			if sourceBatchHash != "" && targetBatchHash != "" &&
+				sourceBatchHash == targetBatchHash &&
+				len(sourceBatch) == len(targetBatch) {
+				// 整批数据一致，跳过 - 但仍需更新 currentKey
+				// 确定下一批的起始键
+				var nextKey interface{}
+				if sourceNext != nil && targetNext != nil {
+					if sourceNext[0].(int64) > targetNext[0].(int64) {
+						nextKey = sourceNext[0]
+					} else {
+						nextKey = targetNext[0]
+					}
+				} else if sourceNext != nil {
+					nextKey = sourceNext[0]
+				} else if targetNext != nil {
+					nextKey = targetNext[0]
+				} else {
+					break // 没有更多数据
+				}
+				currentKey = nextKey
+				continue
+			}
+			// 批大小不同，说明有增/删，跳过行级 hash 预筛选，直接构建 map 比对
 		} else {
+			// 不使用 hash filter，直接读取数据
+			sourceBatch, sourceNext, err = fetchDataByKeyRange(sourceConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+			if err != nil {
+				return diff, fmt.Errorf("读取源表数据失败：%w", err)
+			}
+			targetBatch, targetNext, err = fetchDataByKeyRange(targetConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+			if err != nil {
+				return diff, fmt.Errorf("读取目标表数据失败：%w", err)
+			}
+		}
+
+		if len(sourceBatch) == 0 && len(targetBatch) == 0 {
+			break
+		}
+
+		processedCount += len(sourceBatch)
+		if len(targetBatch) > len(sourceBatch) {
+			processedCount += len(targetBatch) - len(sourceBatch)
+		}
+
+		if cfg.ShowProgress {
+			progress := float64(processedCount) / float64(totalCount) * 100
+			elapsed := time.Since(startTime)
+			fmt.Printf("\r[%s] 进度：%.1f%% (%d/%d), 已耗时 %v", table, progress, processedCount, totalCount, elapsed)
+		}
+
+		// 构建索引比对
+		sourceMap := make(map[string]map[string]interface{})
+		for _, row := range sourceBatch {
+			key := buildKey(row, pkCols)
+			sourceMap[key] = row
+		}
+
+		targetMap := make(map[string]map[string]interface{})
+		for _, row := range targetBatch {
+			key := buildKey(row, pkCols)
+			targetMap[key] = row
+		}
+
+		// 比对
+		for key, srcRow := range sourceMap {
+			if tgtRow, exists := targetMap[key]; exists {
+				// Hash 预筛选（如果启用且有 hash 值）
+				if cfg.HashFilter {
+					srcHashRaw := srcRow["__row_hash__"]
+					tgtHashRaw := tgtRow["__row_hash__"]
+					// 只有当两行都有 hash 值时才使用 hash 预筛选
+					if srcHashRaw != nil && tgtHashRaw != nil {
+						// CRC32 返回整数，直接比较
+						if srcHashRaw == tgtHashRaw {
+							// Hash 相同，跳过详细比对
+							delete(sourceMap, key)
+							delete(targetMap, key)
+							continue
+						}
+						// Hash 不同，删除 hash 字段后进行详细比对
+						delete(srcRow, "__row_hash__")
+						delete(tgtRow, "__row_hash__")
+					}
+				}
+				// 逐字段比对
+				changes := compareRow(srcRow, tgtRow, filteredCols)
+				if len(changes) > 0 {
+					diff.Modified = append(diff.Modified, DataModification{
+						Key:     key,
+						Source:  srcRow,
+						Target:  tgtRow,
+						Changes: changes,
+					})
+				}
+				delete(sourceMap, key)
+				delete(targetMap, key)
+			}
+		}
+		for _, srcRow := range sourceMap {
 			diff.Removed = append(diff.Removed, srcRow)
 		}
-	}
-
-	for key, tgtRow := range targetMap {
-		if _, exists := sourceMap[key]; !exists {
+		for _, tgtRow := range targetMap {
 			diff.Added = append(diff.Added, tgtRow)
 		}
+
+		// 确定下一批的起始键
+		var nextKey interface{}
+		if sourceNext != nil && targetNext != nil {
+			if sourceNext[0].(int64) > targetNext[0].(int64) {
+				nextKey = sourceNext[0]
+			} else {
+				nextKey = targetNext[0]
+			}
+		} else if sourceNext != nil {
+			nextKey = sourceNext[0]
+		} else if targetNext != nil {
+			nextKey = targetNext[0]
+		} else {
+			break
+		}
+		currentKey = nextKey
+	}
+
+	if cfg.ShowProgress {
+		diffCount := len(diff.Modified) + len(diff.Added) + len(diff.Removed)
+		fmt.Printf("\r[%s] 比对完成，耗时 %v，发现 %d 处差异\n", table, time.Since(startTime), diffCount)
 	}
 
 	return diff, nil
+}
+
+// filterColumns 过滤列，返回用于比对的列
+func filterColumns(allColumns []database.ColumnMeta, includeCols, excludeCols []string) []database.ColumnMeta {
+	if len(includeCols) == 0 && len(excludeCols) == 0 {
+		return allColumns
+	}
+
+	// 构建排除集合
+	excludeSet := make(map[string]bool)
+	for _, col := range excludeCols {
+		excludeSet[col] = true
+	}
+
+	// 构建包含集合（如果有指定）
+	includeSet := make(map[string]bool)
+	for _, col := range includeCols {
+		includeSet[col] = true
+	}
+
+	var result []database.ColumnMeta
+	for _, col := range allColumns {
+		// 如果有 include 列表，只保留列表中的
+		if len(includeCols) > 0 && !includeSet[col.Name] {
+			continue
+		}
+		// 排除 exclude 列表中的
+		if excludeSet[col.Name] {
+			continue
+		}
+		result = append(result, col)
+	}
+	return result
+}
+
+// minMaxKey 主键范围
+type minMaxKey struct {
+	MinVal interface{}
+	MaxVal interface{}
+	Count  int64
+}
+
+// getPrimaryKeyRange 获取主键的最小值和最大值
+func getPrimaryKeyRange(conn *database.Connection, table, pkCol string) minMaxKey {
+	var result minMaxKey
+	row := conn.DB.QueryRow(fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`), COUNT(*) FROM `%s`", pkCol, pkCol, table))
+	err := row.Scan(&result.MinVal, &result.MaxVal, &result.Count)
+	if err != nil || result.MinVal == nil {
+		return result
+	}
+	return result
+}
+
+// fetchDataByKeyRange 按主键范围分批获取数据
+func fetchDataByKeyRange(conn *database.Connection, table string, columns []database.ColumnMeta, pkCols []string, startKey []interface{}, limit int) ([]map[string]interface{}, []interface{}, error) {
+	whereClause := fmt.Sprintf("`%s` >= ?", pkCols[0])
+	startVal := startKey[0]
+
+	query := fmt.Sprintf("SELECT * FROM `%s` WHERE %s ORDER BY `%s` LIMIT %d", table, whereClause, pkCols[0], limit+1)
+	rows, err := conn.DB.Query(query, startVal)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	cols, _ := rows.Columns()
+	values := make([]interface{}, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var data []map[string]interface{}
+	var nextKey []interface{}
+	count := 0
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, nil, err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			row[col] = values[i]
+		}
+		if count < limit {
+			data = append(data, row)
+		} else {
+			nextKey = []interface{}{row[pkCols[0]]}
+		}
+		count++
+	}
+
+	return data, nextKey, rows.Err()
+}
+
+// fetchMySQLDataWithHash 按主键范围分批获取数据（带 SQL 层 hash 计算，仅 MySQL）
+// 返回每行数据（含单行 hash）和整批数据的聚合 hash
+func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []database.ColumnMeta, hashColumns []database.ColumnMeta, pkCol string, startKey interface{}, limit int) ([]map[string]interface{}, []interface{}, string, error) {
+	// 构建单行 hash 表达式：CRC32(CONCAT(...))
+	rowHashExpr := "CRC32(CONCAT("
+	for i, c := range hashColumns {
+		if i > 0 {
+			rowHashExpr += `,';',`
+		}
+		// 处理不同类型
+		switch c.DataType {
+		case "int", "integer", "bigint", "smallint", "tinyint", "mediumint":
+			rowHashExpr += fmt.Sprintf("IFNULL(`%s`,'')", c.Name)
+		case "decimal", "numeric", "float", "double":
+			rowHashExpr += fmt.Sprintf("IFNULL(CAST(`%s` AS CHAR),'')", c.Name)
+		case "datetime", "timestamp", "date", "time":
+			rowHashExpr += fmt.Sprintf("IFNULL(DATE_FORMAT(`%s`,'%%Y-%%m-%%d %%H:%%i:%%s'),'')", c.Name)
+		default:
+			rowHashExpr += fmt.Sprintf("IFNULL(`%s`,'')", c.Name)
+		}
+	}
+	rowHashExpr += "))"
+
+	// 构建 SELECT 子句 - 先只查询数据列和单行 hash
+	colNames := make([]string, len(columns))
+	for i, c := range columns {
+		colNames[i] = fmt.Sprintf("`%s`", c.Name)
+	}
+	selectClause := fmt.Sprintf("%s, %s AS row_hash", strings.Join(colNames, ", "), rowHashExpr)
+
+	// 构建查询
+	whereClause := ""
+	args := []interface{}{}
+	if startKey != nil {
+		whereClause = fmt.Sprintf("WHERE `%s` >= ?", pkCol)
+		args = append(args, startKey)
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM `%s` %s ORDER BY `%s` LIMIT ?", selectClause, table, whereClause, pkCol)
+	args = append(args, limit+1) // 多取一行用于判断是否有下一页
+
+	rows, err := conn.DB.Query(query, args...)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	defer rows.Close()
+
+	// 获取列名（包含 row_hash）
+	cols, _ := rows.Columns()
+	values := make([]interface{}, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var data []map[string]interface{}
+	var nextKey []interface{}
+	var batchHash uint64 = 0
+	count := 0
+
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, nil, "", err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			colLower := strings.ToLower(col)
+			if colLower == "row_hash" {
+				// 将单行 hash 值存入特殊字段，并累加到批 hash
+				hashVal := values[i]
+				row["__row_hash__"] = hashVal
+				// CRC32 返回 uint64，累加到批 hash
+				if h, ok := hashVal.(int64); ok {
+					batchHash += uint64(h)
+				}
+			} else {
+				row[col] = values[i]
+			}
+		}
+		if count < limit {
+			data = append(data, row)
+		} else {
+			nextKey = []interface{}{row[pkCol]}
+		}
+		count++
+	}
+
+	return data, nextKey, fmt.Sprintf("%d", batchHash), rows.Err()
 }
 
 // compareTableDataSample 抽样数据对比
@@ -571,22 +959,12 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 	return diff, nil
 }
 
-// getPrimaryKeyColumns 获取主键列
+// getPrimaryKeyColumns 获取主键列（必须有主键或唯一索引）
 func getPrimaryKeyColumns(columns []database.ColumnMeta) []string {
 	var pkCols []string
 	for _, c := range columns {
-		if c.Extra == "auto_increment" {
+		if c.IsPrimaryKey {
 			pkCols = append(pkCols, c.Name)
-			break
-		}
-	}
-	if len(pkCols) == 0 {
-		// 尝试使用第一个字段作为主键
-		for _, c := range columns {
-			if c.Name == "id" {
-				pkCols = append(pkCols, c.Name)
-				break
-			}
 		}
 	}
 	return pkCols
@@ -677,9 +1055,59 @@ func compareRow(source, target map[string]interface{}, columns []database.Column
 	for _, c := range columns {
 		srcVal := source[c.Name]
 		tgtVal := target[c.Name]
-		if fmt.Sprintf("%v", srcVal) != fmt.Sprintf("%v", tgtVal) {
-			changes = append(changes, fmt.Sprintf("%s: %v -> %v", c.Name, srcVal, tgtVal))
+		srcStr := formatValue(srcVal)
+		tgtStr := formatValue(tgtVal)
+		if srcStr != tgtStr {
+			changes = append(changes, fmt.Sprintf("%s: %s -> %s", c.Name, srcStr, tgtStr))
 		}
 	}
 	return changes
+}
+
+// formatValue 格式化字段值，处理二进制和特殊类型
+func formatValue(v interface{}) string {
+	if v == nil {
+		return "NULL"
+	}
+	switch val := v.(type) {
+	case []byte:
+		// 尝试转为字符串
+		str := string(val)
+		// 如果是纯数字字符串，直接显示
+		if isNumeric(str) {
+			return str
+		}
+		// 如果是可打印字符串，直接显示
+		if isPrintable(str) {
+			return str
+		}
+		return fmt.Sprintf("[binary %d bytes]", len(val))
+	default:
+		return fmt.Sprintf("%v", val)
+	}
+}
+
+// isNumeric 检查字符串是否为纯数字
+func isNumeric(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			if r != '.' && r != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isPrintable 检查字符串是否为可打印字符
+func isPrintable(s string) bool {
+	for _, r := range s {
+		if r < 32 && r != '\t' && r != '\n' && r != '\r' {
+			return false
+		}
+	}
+	return true
 }

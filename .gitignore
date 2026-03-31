@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+db-diff
 gsd_db_tool
 
 # Test binary
@@ -30,7 +31,7 @@ Thumbs.db
 # .planning/
 
 # Config with secrets (keep example, ignore actual config if it contains secrets)
-# config.yaml
+config.yaml
 
 # Logs
 *.log

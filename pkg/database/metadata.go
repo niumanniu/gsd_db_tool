@@ -23,6 +23,7 @@ type ColumnMeta struct {
 	Extra           string
 	Comment         string
 	OrdinalPosition int
+	IsPrimaryKey    bool // 是否为主键
 }
 
 // IndexMeta 索引元数据
