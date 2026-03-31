@@ -35,3 +35,26 @@ compare_options:
   sample_size: 1000       # 抽样数量，仅 data_mode=sample 时有效
   tables: []              # 指定表列表，空数组表示所有表
                           # 示例：["users", "orders", "products"]
+
+  # --- 数据对比优化选项 ---
+  include_columns: []     # 只比对的字段列表，空表示所有字段
+                          # 示例：["name", "email", "status"]
+
+  exclude_columns: []     # 跳过比对的字段列表
+                          # 示例：["updated_at", "created_at"]
+
+  hash_filter: false      # 是否启用 hash 预筛选（提高大宽表性能）
+                          # 实现原理：
+                          #   1. 单行 hash：使用 MySQL CRC32() 函数计算每行数据的 hash 值
+                          #   2. 批聚合 hash：对每批 1000 行计算 SUM(CRC32(...))，快速判断整批是否一致
+                          # 适用场景：
+                          #   - 50+ 字段的大宽表
+                          #   - 数据几乎完全相同（差异率<1%）
+                          #   - 跨数据中心比对（网络延迟高）
+                          # 不适用：
+                          #   - 字段少、差异率高的场景（hash 计算开销可能超过收益）
+                          #   - 频繁增删的场景（批聚合 hash 容易失效）
+
+  show_full_data: false   # 是否显示完整数据（源数据和目标数据）
+
+  show_progress: false    # 是否显示进度和耗时
