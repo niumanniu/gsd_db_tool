@@ -54,6 +54,35 @@
 
 ---
 
+## v2.1 Summary
+
+**0/1 phases complete.** 1 requirement planned.
+
+| Phase | Requirements | Status |
+|-------|-------------|--------|
+| Phase 5 | 1 | Pending |
+
+---
+
+## Phase 5: 并行查询优化
+
+**Status:** Pending
+
+**Goal:** 将源和目标数据库的查询操作改为并行执行，提升比对速度
+
+**Requirements:**
+- **PERF-01:** 并行查询优化 — 使用 goroutine 实现并发查询，减少网络延迟场景下的总体等待时间
+
+**Success Criteria:**
+- 源表和目标表的批次数据读取同时发起
+- 等待两个查询都完成后再进行比对
+- 错误处理正确，任一查询失败时另一个查询被取消
+- 性能提升可测量（网络延迟 100ms 场景下，期望 ~50% 时间减少）
+
+**Plans:** 0/1 complete
+
+---
+
 ## Phase 4: Oracle + 跨数据库支持 ✓
 
 **Status:** Complete (2026-03-28)

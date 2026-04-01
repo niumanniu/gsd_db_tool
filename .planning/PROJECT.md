@@ -50,7 +50,9 @@
 - ✓ V2-01: Oracle 数据库支持 — Phase 4
 - ✓ V2-02: 跨数据库对比（MySQL ↔ Oracle）— Phase 4
 
-### Active (v2.0)
+### Active (v2.1)
+
+- PERF-01: 并行查询优化 — 源和目标数据库查询改为并行执行，提升比对速度
 
 ### Out of Scope
 
