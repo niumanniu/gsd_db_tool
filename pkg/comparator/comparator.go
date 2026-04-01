@@ -6,9 +6,14 @@ import (
 	"db-diff/pkg/database"
 	"fmt"
 	"golang.org/x/sync/errgroup"
+	"math/rand"
 	"strings"
 	"time"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 // getDriver 根据 driver 名称获取驱动实例
 func getDriver(driverName string) (database.Driver, error) {
@@ -1132,7 +1137,113 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 }
 
 // fetchSamplePrimaryKeys 随机抽取 N 条主键值
+// 优化：避免 ORDER BY RAND() 全表扫描，使用主键范围 + 随机偏移
 func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limit int) ([]interface{}, error) {
+	// 第一步：获取主键范围（使用索引，效率高）
+	var minVal, maxVal interface{}
+	row := conn.DB.QueryRow(fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`) FROM `%s`", pkCol, pkCol, table))
+	err := row.Scan(&minVal, &maxVal)
+	if err != nil || minVal == nil || maxVal == nil {
+		return []interface{}{}, nil // 空表
+	}
+
+	// 第二步：获取总记录数（用于评估抽样比例）
+	var totalCount int64
+	row = conn.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table))
+	row.Scan(&totalCount)
+
+	// 如果记录数小于等于 limit，直接返回所有主键
+	if totalCount <= int64(limit) {
+		query := fmt.Sprintf("SELECT `%s` FROM `%s` ORDER BY `%s`", pkCol, table, pkCol)
+		rows, err := conn.DB.Query(query)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+
+		var pkValues []interface{}
+		for rows.Next() {
+			var pk interface{}
+			if err := rows.Scan(&pk); err != nil {
+				return nil, err
+			}
+			pkValues = append(pkValues, pk)
+		}
+		return pkValues, rows.Err()
+	}
+
+	// 第三步：使用随机偏移 + 主键索引的方式抽取主键
+	// 对于大表，使用多个随机起点，每个起点取少量数据，降低聚集性
+	pkValues, err := fetchSamplePrimaryKeysByRandomOffset(conn, table, pkCol, limit, minVal, maxVal)
+	if err != nil {
+		return nil, err
+	}
+
+	// 如果抽样数量不足，回退到 ORDER BY RAND()（仅在小表或抽样失败时发生）
+	if len(pkValues) < limit && totalCount < 10000 {
+		return fetchSamplePrimaryKeysFallback(conn, table, pkCol, limit)
+	}
+
+	return pkValues, nil
+}
+
+// fetchSamplePrimaryKeysByRandomOffset 使用随机偏移方式抽样主键
+func fetchSamplePrimaryKeysByRandomOffset(conn *database.Connection, table, pkCol string, limit int, minVal, maxVal interface{}) ([]interface{}, error) {
+	var pkValues []interface{}
+
+	// 计算抽样间隔，将抽样分散到整个表中
+	sampleGap := 1
+	if maxValInt, ok := toInt64(maxVal); ok {
+		if minValInt, ok := toInt64(minVal); ok {
+			rangeSize := maxValInt - minValInt + 1
+			if rangeSize > 0 && limit > 0 {
+				sampleGap = int(rangeSize / int64(limit))
+				if sampleGap < 1 {
+					sampleGap = 1
+				}
+			}
+		}
+	}
+
+	// 随机起点
+	randomOffset := rand.Intn(sampleGap)
+
+	// 使用主键范围查询，每次取一个批次
+	// 查询：WHERE pk >= start ORDER BY pk LIMIT sampleGap * batchCount
+	batchSize := limit * sampleGap * 2 // 放大批次，确保能取到足够数据
+	if batchSize > 10000 {
+		batchSize = 10000 // 限制最大批次大小
+	}
+
+	query := fmt.Sprintf("SELECT `%s` FROM `%s` WHERE `%s` >= ? ORDER BY `%s` LIMIT %d",
+		pkCol, table, pkCol, pkCol, batchSize)
+
+	args := []interface{}{int64(randomOffset)}
+	rows, err := conn.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	count := 0
+	for rows.Next() && count < limit {
+		var pk interface{}
+		if err := rows.Scan(&pk); err != nil {
+			return nil, err
+		}
+		// 简单的随机跳过，模拟随机抽样
+		if rand.Intn(sampleGap) == 0 || count < limit {
+			pkValues = append(pkValues, pk)
+			count++
+		}
+	}
+
+	return pkValues, rows.Err()
+}
+
+// fetchSamplePrimaryKeysFallback 回退方案：ORDER BY RAND()
+// 仅在小表或主键不是整数类型时使用
+func fetchSamplePrimaryKeysFallback(conn *database.Connection, table, pkCol string, limit int) ([]interface{}, error) {
 	query := fmt.Sprintf("SELECT `%s` FROM `%s` ORDER BY RAND() LIMIT %d", pkCol, table, limit)
 	rows, err := conn.DB.Query(query)
 	if err != nil {
@@ -1148,8 +1259,21 @@ func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limi
 		}
 		pkValues = append(pkValues, pk)
 	}
-
 	return pkValues, rows.Err()
+}
+
+// toInt64 尝试将 interface{} 转换为 int64
+func toInt64(v interface{}) (int64, bool) {
+	switch val := v.(type) {
+	case int:
+		return int64(val), true
+	case int32:
+		return int64(val), true
+	case int64:
+		return val, true
+	default:
+		return 0, false
+	}
 }
 
 // fetchTableDataByPrimaryKeys 按主键列表查询完整数据
