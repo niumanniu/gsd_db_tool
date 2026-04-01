@@ -712,9 +712,9 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 				avgProgress := (sourceProgress + targetProgress) / 2
 				elapsed := time.Since(startTime)
 				savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
-				fmt.Printf("\r[%s] 进度：%.1f%% (源：%.1f%% | 目标：%.1f%%), 已耗时 %v, 本批：%dms (节省 %.1f%%)",
+				fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %v, 本批：%dms (节省 %.1f%%)",
 					table,
-					avgProgress, sourceProgress, targetProgress,
+					avgProgress,
 					elapsed, batchTime, savingsPercent)
 			}
 			continue
@@ -735,9 +735,9 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 			avgProgress := (sourceProgress + targetProgress) / 2
 			elapsed := time.Since(startTime)
 			savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
-			fmt.Printf("\r[%s] 进度：%.1f%% (源：%.1f%% | 目标：%.1f%%), 已耗时 %v, 本批：%dms (节省 %.1f%%)",
+			fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %v, 本批：%dms (节省 %.1f%%)",
 				table,
-				avgProgress, sourceProgress, targetProgress,
+				avgProgress,
 				elapsed, batchTime, savingsPercent)
 		}
 

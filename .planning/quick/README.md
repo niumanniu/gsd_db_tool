@@ -1,19 +1,26 @@
-# Quick Task: 平均进度显示
+# Quick Task: 简化进度显示
 
 ## Task
-将进度显示改为平均进度模式 `(source+target)/2`
+去掉括号中的源/目标详细进度，只保留平均进度
 
 ## Changes
 - 修改 `pkg/comparator/comparator.go` 中两处进度显示代码
-- 计算平均进度 `avgProgress = (sourceProgress + targetProgress) / 2`
-- 显示格式：`进度：XX.X% (源：XX.X% | 目标：XX.X%)`
+- 移除 `(源：XX.X% | 目标：XX.X%)` 详细显示
+- 只保留平均进度
 
-## Before
+## 演进过程
+
+### 原始格式
 ```
 [core_license_photo_en] Source: 24.0% (2000/8324) | Target: 24.0% (2000/8323), 已耗时 2.29s, 本批：串行预估 2238ms, 并行实际 1119ms, 节省 50.0%
 ```
 
-## After
+### 第一次修改（平均进度 + 详细）
 ```
 [core_license_photo_en] 进度：24.0% (源：24.0% | 目标：24.0%), 已耗时 2.29s, 本批：1119ms (节省 50.0%)
+```
+
+### 最终格式（简洁平均进度）
+```
+[core_license_photo_en] 进度：24.0%, 已耗时 2.29s, 本批：1119ms (节省 50.0%)
 ```
