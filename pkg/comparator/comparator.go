@@ -703,19 +703,19 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 			}
 			currentKey = nextKey
 
-			// 更新进度（双进度显示）
+			// 更新进度（平均进度显示）
 			processedSource += len(sourceBatch)
 			processedTarget += len(targetBatch)
 			if cfg.ShowProgress {
 				sourceProgress := float64(processedSource) / float64(totalSource) * 100
 				targetProgress := float64(processedTarget) / float64(totalTarget) * 100
+				avgProgress := (sourceProgress + targetProgress) / 2
 				elapsed := time.Since(startTime)
 				savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
-				fmt.Printf("\r[%s] Source: %.1f%% (%d/%d) | Target: %.1f%% (%d/%d), 已耗时 %v, 本批：串行预估 %dms, 并行实际 %dms, 节省 %.1f%%",
+				fmt.Printf("\r[%s] 进度：%.1f%% (源：%.1f%% | 目标：%.1f%%), 已耗时 %v, 本批：%dms (节省 %.1f%%)",
 					table,
-					sourceProgress, processedSource, totalSource,
-					targetProgress, processedTarget, totalTarget,
-					elapsed, estimatedSerial, batchTime, savingsPercent)
+					avgProgress, sourceProgress, targetProgress,
+					elapsed, batchTime, savingsPercent)
 			}
 			continue
 		}
@@ -728,17 +728,17 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 		processedSource += len(sourceBatch)
 		processedTarget += len(targetBatch)
 
-		// 双进度显示 + 性能计时（Task 3 + Task 4）
+		// 平均进度显示 + 性能计时（Task 3 + Task 4）
 		if cfg.ShowProgress {
 			sourceProgress := float64(processedSource) / float64(totalSource) * 100
 			targetProgress := float64(processedTarget) / float64(totalTarget) * 100
+			avgProgress := (sourceProgress + targetProgress) / 2
 			elapsed := time.Since(startTime)
 			savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
-			fmt.Printf("\r[%s] Source: %.1f%% (%d/%d) | Target: %.1f%% (%d/%d), 已耗时 %v, 本批：串行预估 %dms, 并行实际 %dms, 节省 %.1f%%",
+			fmt.Printf("\r[%s] 进度：%.1f%% (源：%.1f%% | 目标：%.1f%%), 已耗时 %v, 本批：%dms (节省 %.1f%%)",
 				table,
-				sourceProgress, processedSource, totalSource,
-				targetProgress, processedTarget, totalTarget,
-				elapsed, estimatedSerial, batchTime, savingsPercent)
+				avgProgress, sourceProgress, targetProgress,
+				elapsed, batchTime, savingsPercent)
 		}
 
 		// 构建当前批次的 map，并与上一批剩余的记录合并
