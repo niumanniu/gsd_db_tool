@@ -1065,23 +1065,24 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 
 	// 计算抽样数量：优先使用 SampleSize，否则使用 SampleRatio
 	sampleSize := 0
+
 	if cfg.SampleSize > 0 {
-		// 用户指定了抽样数量，直接使用
+		// 用户指定了抽样数量，直接使用（不受默认 maxSampleSize 限制）
 		sampleSize = cfg.SampleSize
 	} else {
 		// 使用抽样比例计算
 		sampleSize = int(float64(totalCount) * cfg.SampleRatio)
+		// 只有在使用 ratio 模式时，才应用 maxSampleSize 限制
+		maxSampleSize := cfg.MaxSampleSize
+		if maxSampleSize <= 0 {
+			maxSampleSize = 1000
+		}
+		if sampleSize > maxSampleSize {
+			sampleSize = maxSampleSize
+		}
 	}
 	if sampleSize < 1 {
 		sampleSize = 1
-	}
-	// 使用配置的最大抽样数限制
-	maxSampleSize := cfg.MaxSampleSize
-	if maxSampleSize <= 0 {
-		maxSampleSize = 1000
-	}
-	if sampleSize > maxSampleSize {
-		sampleSize = maxSampleSize
 	}
 
 	if cfg.ShowProgress {
