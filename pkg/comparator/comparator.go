@@ -220,7 +220,7 @@ func Compare(cfg *config.Config) (*DiffResult, error) {
 			case config.DataModeFull:
 				result.TableDataDiff[table], _ = compareTableDataFull(sourceConn, targetConn, table, cols, &cfg.CompareOptions)
 			case config.DataModeSample:
-				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cfg.CompareOptions.SampleRatio, cols, &cfg.CompareOptions)
+				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cols, &cfg.CompareOptions)
 			default:
 				// 默认只对比记录数
 				count, _ := compareTableCount(sourceConn, targetConn, table)
@@ -1048,7 +1048,7 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 }
 
 // compareTableDataSample 抽样数据对比
-func compareTableDataSample(sourceConn, targetConn *database.Connection, table string, ratio float64, columns []database.ColumnMeta, cfg *config.CompareOptions) (DataDiff, error) {
+func compareTableDataSample(sourceConn, targetConn *database.Connection, table string, columns []database.ColumnMeta, cfg *config.CompareOptions) (DataDiff, error) {
 	var diff DataDiff
 	startTime := time.Now()
 
@@ -1063,17 +1063,29 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 	row := sourceConn.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table))
 	row.Scan(&totalCount)
 
-	// 计算抽样数量
-	sampleSize := int(float64(totalCount) * ratio)
+	// 计算抽样数量：优先使用 SampleSize，否则使用 SampleRatio
+	sampleSize := 0
+	if cfg.SampleSize > 0 {
+		// 用户指定了抽样数量，直接使用
+		sampleSize = cfg.SampleSize
+	} else {
+		// 使用抽样比例计算
+		sampleSize = int(float64(totalCount) * cfg.SampleRatio)
+	}
 	if sampleSize < 1 {
 		sampleSize = 1
 	}
-	if sampleSize > 1000 {
-		sampleSize = 1000 // 限制最大抽样数
+	// 使用配置的最大抽样数限制
+	maxSampleSize := cfg.MaxSampleSize
+	if maxSampleSize <= 0 {
+		maxSampleSize = 1000
+	}
+	if sampleSize > maxSampleSize {
+		sampleSize = maxSampleSize
 	}
 
 	if cfg.ShowProgress {
-		fmt.Printf("\r[%s] 开始抽样比对，抽样比例 %.1f%%，样本数 %d\n", table, ratio*100, sampleSize)
+		fmt.Printf("\r[%s] 开始抽样比对，抽样比例 %.1f%%，样本数 %d\n", table, cfg.SampleRatio*100, sampleSize)
 	}
 
 	// 第一步：从源库随机抽取 N 条记录的主键

@@ -20,6 +20,8 @@ var (
 	verbose     bool
 	dataMode    string
 	sampleRatio float64
+	sampleSize  int
+	maxSampleSize int
 	tablesFlag  string
 
 	// 数据对比优化选项
@@ -56,6 +58,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "显示详细信息")
 	rootCmd.Flags().StringVarP(&dataMode, "data-mode", "m", "count", "数据对比模式 (count|full|sample)")
 	rootCmd.Flags().Float64VarP(&sampleRatio, "sample-ratio", "r", 0.1, "抽样比例 (0.0-1.0)")
+	rootCmd.Flags().IntVar(&sampleSize, "sample-size", 0, "抽样数量（指定后忽略 sample-ratio）")
+	rootCmd.Flags().IntVar(&maxSampleSize, "max-sample-size", 1000, "最大抽样数量")
 	rootCmd.Flags().StringVarP(&tablesFlag, "tables", "T", "", "指定表列表，逗号分隔")
 
 	// 数据对比优化选项
@@ -85,6 +89,12 @@ func runDiff(cmd *cobra.Command, args []string) error {
 	}
 	if cmd.Flags().Changed("sample-ratio") {
 		cfg.CompareOptions.SampleRatio = sampleRatio
+	}
+	if cmd.Flags().Changed("sample-size") {
+		cfg.CompareOptions.SampleSize = sampleSize
+	}
+	if cmd.Flags().Changed("max-sample-size") {
+		cfg.CompareOptions.MaxSampleSize = maxSampleSize
 	}
 	if cmd.Flags().Changed("tables") {
 		// 解析逗号分隔的表名列表

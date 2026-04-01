@@ -23,7 +23,8 @@ type CompareOptions struct {
 	Mode            DataMode `yaml:"mode"`              // 对比模式：structure|data
 	DataMode        DataMode `yaml:"data_mode"`         // 数据对比模式：count|full|sample
 	SampleRatio     float64  `yaml:"sample_ratio"`      // 抽样比例 (0.0-1.0)
-	SampleSize      int      `yaml:"sample_size"`       // 抽样数量
+	SampleSize      int      `yaml:"sample_size"`       // 抽样数量（指定后优先使用，忽略 sample_ratio）
+	MaxSampleSize   int      `yaml:"max_sample_size"`   // 最大抽样数量，默认 1000
 	Tables          []string `yaml:"tables"`            // 指定表列表，空表示所有表
 	IncludeColumns  []string `yaml:"include_columns"`   // 只比对的字段列表，空表示所有字段
 	ExcludeColumns  []string `yaml:"exclude_columns"`   // 跳过比对的字段列表
@@ -156,6 +157,9 @@ func (c *Config) Validate() error {
 	if c.CompareOptions.DataMode == DataModeSample {
 		if c.CompareOptions.SampleRatio <= 0 || c.CompareOptions.SampleRatio > 1 {
 			c.CompareOptions.SampleRatio = 0.1 // 默认 10% 抽样
+		}
+		if c.CompareOptions.MaxSampleSize <= 0 {
+			c.CompareOptions.MaxSampleSize = 1000 // 默认最大抽样 1000 条
 		}
 	}
 	return nil
