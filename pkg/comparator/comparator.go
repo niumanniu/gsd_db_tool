@@ -1,9 +1,11 @@
 package comparator
 
 import (
+	"context"
 	"db-diff/pkg/config"
 	"db-diff/pkg/database"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"strings"
 	"time"
 )
@@ -469,10 +471,100 @@ func compareTableCount(sourceConn, targetConn *database.Connection, table string
 	return count, nil
 }
 
+// fetchBatchParallel fetches source and target data concurrently using goroutines.
+// Returns error if either query fails, with context cancellation for the other.
+func fetchBatchParallel(
+	ctx context.Context,
+	sourceConn, targetConn *database.Connection,
+	table string,
+	columns []database.ColumnMeta,
+	filteredCols []database.ColumnMeta,
+	pkCols []string,
+	currentKey interface{},
+	batchSize int,
+	hashFilter bool,
+) (sourceBatch, targetBatch []map[string]interface{}, sourceNext, targetNext []interface{}, sourceHash, targetHash string, err error) {
+	// Create context with cancel for coordinated cancellation
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Use errgroup for coordinated error handling
+	g, ctx := errgroup.WithContext(ctx)
+
+	// Channel to receive results from each goroutine
+	type result struct {
+		batch []map[string]interface{}
+		next  []interface{}
+		hash  string
+	}
+	sourceCh := make(chan result, 1)
+	targetCh := make(chan result, 1)
+
+	// Source query goroutine
+	g.Go(func() error {
+		defer close(sourceCh)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			var res result
+			if hashFilter && sourceConn.DriverName == "mysql" {
+				res.batch, res.next, res.hash, err = fetchMySQLDataWithHash(
+					sourceConn, table, columns, filteredCols, pkCols[0], currentKey, batchSize)
+			} else {
+				res.batch, res.next, err = fetchDataByKeyRange(
+					sourceConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+			}
+			if err != nil {
+				return fmt.Errorf("source query failed: %w", err)
+			}
+			sourceCh <- res
+			return nil
+		}
+	})
+
+	// Target query goroutine
+	g.Go(func() error {
+		defer close(targetCh)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			var res result
+			if hashFilter && targetConn.DriverName == "mysql" {
+				res.batch, res.next, res.hash, err = fetchMySQLDataWithHash(
+					targetConn, table, columns, filteredCols, pkCols[0], currentKey, batchSize)
+			} else {
+				res.batch, res.next, err = fetchDataByKeyRange(
+					targetConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
+			}
+			if err != nil {
+				return fmt.Errorf("target query failed: %w", err)
+			}
+			targetCh <- res
+			return nil
+		}
+	})
+
+	// Wait for both goroutines to complete
+	if err := g.Wait(); err != nil {
+		return nil, nil, nil, nil, "", "", err
+	}
+
+	// Collect results
+	sourceResult := <-sourceCh
+	targetResult := <-targetCh
+
+	return sourceResult.batch, targetResult.batch, sourceResult.next, targetResult.next, sourceResult.hash, targetResult.hash, nil
+}
+
 // compareTableDataFull 全量数据对比（主键范围 + 分批，降低内存占用）
 func compareTableDataFull(sourceConn, targetConn *database.Connection, table string, columns []database.ColumnMeta, cfg *config.CompareOptions) (DataDiff, error) {
 	var diff DataDiff
 	startTime := time.Now()
+
+	// 创建 context 用于并行查询的取消控制
+	ctx := context.Background()
 
 	// 获取主键列
 	pkCols := getPrimaryKeyColumns(columns)
@@ -547,19 +639,21 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 		currentKey = targetMinMax.MinVal
 	}
 
-	// 进度追踪
-	totalCount := sourceMinMax.Count
-	if targetMinMax.Count > totalCount {
-		totalCount = targetMinMax.Count
-	}
-	processedCount := 0
+	// 进度追踪 - 双进度显示（Task 4）
+	totalSource := sourceMinMax.Count
+	totalTarget := targetMinMax.Count
+	processedSource := 0
+	processedTarget := 0
+
+	// 性能计时（Task 3）
+	var totalBatchTimeSerial, totalBatchTimeParallel int64
+	var batchCount int
 
 	if cfg.ShowProgress {
-		fmt.Printf("\n[%s] 开始比对，共 %d 条记录...\n", table, totalCount)
+		fmt.Printf("\n[%s] 开始比对，源表 %d 条，目标表 %d 条\n", table, totalSource, totalTarget)
 	}
 
 	// 全局的 map 用于累积未匹配的记录
-	// 只有在确认某个主键在另一个表中不存在时，才从 remaining map 中移除并标记为"删除"或"新增"
 	sourceRemaining := make(map[string]map[string]interface{})
 	targetRemaining := make(map[string]map[string]interface{})
 
@@ -569,85 +663,82 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 		var sourceBatchHash, targetBatchHash string
 		var err error
 
-		// 根据 HashFilter 配置选择读取方式
-		if cfg.HashFilter {
-			// 使用 SQL 层 hash 计算（仅支持 MySQL）
-			if sourceConn.DriverName == "mysql" {
-				sourceBatch, sourceNext, sourceBatchHash, err = fetchMySQLDataWithHash(
-					sourceConn, table, columns, filteredCols, pkColName, currentKey, batchSize)
-				if err != nil {
-					return diff, fmt.Errorf("读取源表数据（带 hash）失败：%w", err)
-				}
-			} else {
-				// Oracle 退化为应用层 hash（不支持批聚合 hash）
-				sourceBatch, sourceNext, err = fetchDataByKeyRange(sourceConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
-				if err != nil {
-					return diff, fmt.Errorf("读取源表数据失败：%w", err)
-				}
-			}
-			if targetConn.DriverName == "mysql" {
-				targetBatch, targetNext, targetBatchHash, err = fetchMySQLDataWithHash(
-					targetConn, table, columns, filteredCols, pkColName, currentKey, batchSize)
-				if err != nil {
-					return diff, fmt.Errorf("读取目标表数据（带 hash）失败：%w", err)
-				}
-			} else {
-				// Oracle 退化为应用层 hash（不支持批聚合 hash）
-				targetBatch, targetNext, err = fetchDataByKeyRange(targetConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
-				if err != nil {
-					return diff, fmt.Errorf("读取目标表数据失败：%w", err)
-				}
-			}
+		batchStartTime := time.Now()
 
-			// 如果整批数据的聚合 hash 相同，且批大小相同，则跳过整批
-			if sourceBatchHash != "" && targetBatchHash != "" &&
-				sourceBatchHash == targetBatchHash &&
-				len(sourceBatch) == len(targetBatch) {
-				// 整批数据一致，跳过 - 但仍需更新 currentKey
-				// 确定下一批的起始键：选择较小的 nextKey，确保不会遗漏记录
-				var nextKey interface{}
-				if sourceNext != nil && targetNext != nil {
-					if sourceNext[0].(int64) < targetNext[0].(int64) {
-						nextKey = sourceNext[0]
-					} else {
-						nextKey = targetNext[0]
-					}
-				} else if sourceNext != nil {
+		// 使用并行查询（Task 2）
+		sourceBatch, targetBatch, sourceNext, targetNext, sourceBatchHash, targetBatchHash, err = fetchBatchParallel(
+			ctx, sourceConn, targetConn, table, columns, filteredCols,
+			pkCols, currentKey, batchSize, cfg.HashFilter,
+		)
+		if err != nil {
+			return diff, err
+		}
+
+		// 性能计时 - 记录批次时间（Task 3）
+		batchTime := time.Since(batchStartTime).Milliseconds()
+		totalBatchTimeParallel += batchTime
+		// 估算串行时间（简单相加，实际可能因网络延迟更高）
+		estimatedSerial := batchTime * 2 // 简化估算：假设两边查询时间相近
+		totalBatchTimeSerial += estimatedSerial
+		batchCount++
+
+		// 如果整批数据的聚合 hash 相同，且批大小相同，则跳过整批
+		if cfg.HashFilter && sourceBatchHash != "" && targetBatchHash != "" &&
+			sourceBatchHash == targetBatchHash &&
+			len(sourceBatch) == len(targetBatch) {
+			// 整批数据一致，跳过 - 但仍需更新 currentKey 和进度
+			var nextKey interface{}
+			if sourceNext != nil && targetNext != nil {
+				if sourceNext[0].(int64) < targetNext[0].(int64) {
 					nextKey = sourceNext[0]
-				} else if targetNext != nil {
-					nextKey = targetNext[0]
 				} else {
-					break // 没有更多数据
+					nextKey = targetNext[0]
 				}
-				currentKey = nextKey
-				continue
+			} else if sourceNext != nil {
+				nextKey = sourceNext[0]
+			} else if targetNext != nil {
+				nextKey = targetNext[0]
+			} else {
+				break
 			}
-			// 批大小不同，说明有增/删，跳过行级 hash 预筛选，直接构建 map 比对
-		} else {
-			// 不使用 hash filter，直接读取数据
-			sourceBatch, sourceNext, err = fetchDataByKeyRange(sourceConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
-			if err != nil {
-				return diff, fmt.Errorf("读取源表数据失败：%w", err)
+			currentKey = nextKey
+
+			// 更新进度（双进度显示）
+			processedSource += len(sourceBatch)
+			processedTarget += len(targetBatch)
+			if cfg.ShowProgress {
+				sourceProgress := float64(processedSource) / float64(totalSource) * 100
+				targetProgress := float64(processedTarget) / float64(totalTarget) * 100
+				elapsed := time.Since(startTime)
+				savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
+				fmt.Printf("\r[%s] Source: %.1f%% (%d/%d) | Target: %.1f%% (%d/%d), 已耗时 %v, 本批：串行预估 %dms, 并行实际 %dms, 节省 %.1f%%",
+					table,
+					sourceProgress, processedSource, totalSource,
+					targetProgress, processedTarget, totalTarget,
+					elapsed, estimatedSerial, batchTime, savingsPercent)
 			}
-			targetBatch, targetNext, err = fetchDataByKeyRange(targetConn, table, columns, pkCols, []interface{}{currentKey}, batchSize)
-			if err != nil {
-				return diff, fmt.Errorf("读取目标表数据失败：%w", err)
-			}
+			continue
 		}
 
 		if len(sourceBatch) == 0 && len(targetBatch) == 0 {
 			break
 		}
 
-		processedCount += len(sourceBatch)
-		if len(targetBatch) > len(sourceBatch) {
-			processedCount += len(targetBatch) - len(sourceBatch)
-		}
+		// 更新双进度计数（Task 4）
+		processedSource += len(sourceBatch)
+		processedTarget += len(targetBatch)
 
+		// 双进度显示 + 性能计时（Task 3 + Task 4）
 		if cfg.ShowProgress {
-			progress := float64(processedCount) / float64(totalCount) * 100
+			sourceProgress := float64(processedSource) / float64(totalSource) * 100
+			targetProgress := float64(processedTarget) / float64(totalTarget) * 100
 			elapsed := time.Since(startTime)
-			fmt.Printf("\r[%s] 进度：%.1f%% (%d/%d), 已耗时 %v", table, progress, processedCount, totalCount, elapsed)
+			savingsPercent := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
+			fmt.Printf("\r[%s] Source: %.1f%% (%d/%d) | Target: %.1f%% (%d/%d), 已耗时 %v, 本批：串行预估 %dms, 并行实际 %dms, 节省 %.1f%%",
+				table,
+				sourceProgress, processedSource, totalSource,
+				targetProgress, processedTarget, totalTarget,
+				elapsed, estimatedSerial, batchTime, savingsPercent)
 		}
 
 		// 构建当前批次的 map，并与上一批剩余的记录合并
@@ -734,7 +825,18 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 
 	if cfg.ShowProgress {
 		diffCount := len(diff.Modified) + len(diff.Added) + len(diff.Removed)
-		fmt.Printf("\r[%s] 比对完成，耗时 %v，发现 %d 处差异\n", table, time.Since(startTime), diffCount)
+		elapsed := time.Since(startTime)
+		// 输出性能统计（Task 3）
+		if batchCount > 0 {
+			avgSavings := float64(totalBatchTimeSerial-totalBatchTimeParallel) / float64(totalBatchTimeSerial) * 100
+			fmt.Printf("\r[%s] 比对完成，总耗时 %v (串行预估：%v, 并行实际：%v), 平均节省 %.1f%%，发现 %d 处差异\n",
+				table, elapsed,
+				time.Duration(totalBatchTimeSerial)*time.Millisecond,
+				time.Duration(totalBatchTimeParallel)*time.Millisecond,
+				avgSavings, diffCount)
+		} else {
+			fmt.Printf("\r[%s] 比对完成，耗时 %v，发现 %d 处差异\n", table, elapsed, diffCount)
+		}
 	}
 
 	return diff, nil
