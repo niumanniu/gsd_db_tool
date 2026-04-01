@@ -220,7 +220,7 @@ func Compare(cfg *config.Config) (*DiffResult, error) {
 			case config.DataModeFull:
 				result.TableDataDiff[table], _ = compareTableDataFull(sourceConn, targetConn, table, cols, &cfg.CompareOptions)
 			case config.DataModeSample:
-				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cfg.CompareOptions.SampleRatio, cols)
+				result.TableDataDiff[table], _ = compareTableDataSample(sourceConn, targetConn, table, cfg.CompareOptions.SampleRatio, cols, &cfg.CompareOptions)
 			default:
 				// 默认只对比记录数
 				count, _ := compareTableCount(sourceConn, targetConn, table)
@@ -1048,8 +1048,9 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 }
 
 // compareTableDataSample 抽样数据对比
-func compareTableDataSample(sourceConn, targetConn *database.Connection, table string, ratio float64, columns []database.ColumnMeta) (DataDiff, error) {
+func compareTableDataSample(sourceConn, targetConn *database.Connection, table string, ratio float64, columns []database.ColumnMeta, cfg *config.CompareOptions) (DataDiff, error) {
 	var diff DataDiff
+	startTime := time.Now()
 
 	// 获取主键列
 	pkCols := getPrimaryKeyColumns(columns)
@@ -1071,6 +1072,10 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 		sampleSize = 1000 // 限制最大抽样数
 	}
 
+	if cfg.ShowProgress {
+		fmt.Printf("\r[%s] 开始抽样比对，抽样比例 %.1f%%，样本数 %d\n", table, ratio*100, sampleSize)
+	}
+
 	// 第一步：从源库随机抽取 N 条记录的主键
 	sourcePKs, err := fetchSamplePrimaryKeys(sourceConn, table, pkCols[0], sampleSize)
 	if err != nil {
@@ -1079,6 +1084,9 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 
 	if len(sourcePKs) == 0 {
 		// 源表为空
+		if cfg.ShowProgress {
+			fmt.Printf("\r[%s] 抽样比对完成，耗时 %.1fs，源表为空\n", table, time.Since(startTime).Seconds())
+		}
 		return diff, nil
 	}
 
@@ -1131,6 +1139,11 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 		if _, exists := sourceMap[key]; !exists {
 			diff.Added = append(diff.Added, tgtRow)
 		}
+	}
+
+	if cfg.ShowProgress {
+		diffCount := len(diff.Modified) + len(diff.Added) + len(diff.Removed)
+		fmt.Printf("\r[%s] 抽样比对完成，耗时 %.1fs，发现 %d 处差异\n", table, time.Since(startTime).Seconds(), diffCount)
 	}
 
 	return diff, nil
