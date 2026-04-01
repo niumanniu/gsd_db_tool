@@ -1046,6 +1046,12 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 func compareTableDataSample(sourceConn, targetConn *database.Connection, table string, ratio float64, columns []database.ColumnMeta) (DataDiff, error) {
 	var diff DataDiff
 
+	// 获取主键列
+	pkCols := getPrimaryKeyColumns(columns)
+	if len(pkCols) == 0 {
+		return diff, fmt.Errorf("表 %s 没有主键或唯一索引，无法进行抽样对比", table)
+	}
+
 	// 获取总记录数
 	var totalCount int64
 	row := sourceConn.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table))
@@ -1060,41 +1066,140 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 		sampleSize = 1000 // 限制最大抽样数
 	}
 
-	// 随机抽样
-	sourceData, err := fetchTableDataSample(sourceConn, table, columns, sampleSize)
+	// 第一步：从源库随机抽取 N 条记录的主键
+	sourcePKs, err := fetchSamplePrimaryKeys(sourceConn, table, pkCols[0], sampleSize)
 	if err != nil {
 		return diff, err
 	}
 
-	targetData, err := fetchTableDataSample(targetConn, table, columns, sampleSize)
+	if len(sourcePKs) == 0 {
+		// 源表为空
+		return diff, nil
+	}
+
+	// 第二步：使用抽取的主键，分别从源库和目标库查询完整数据
+	sourceData, err := fetchTableDataByPrimaryKeys(sourceConn, table, columns, pkCols[0], sourcePKs)
 	if err != nil {
 		return diff, err
 	}
 
-	// 简单对比（抽样模式下只对比记录数和前 N 条）
-	if len(sourceData) != len(targetData) {
-		diff.Modified = append(diff.Modified, DataModification{
-			Key:     "sample_count",
-			Changes: []string{fmt.Sprintf("抽样数量：%d vs %d", len(sourceData), len(targetData))},
-		})
+	targetData, err := fetchTableDataByPrimaryKeys(targetConn, table, columns, pkCols[0], sourcePKs)
+	if err != nil {
+		return diff, err
 	}
 
-	// 对比抽样数据
-	for i := range sourceData {
-		if i < len(targetData) {
-			changes := compareRow(sourceData[i], targetData[i], columns)
+	// 第三步：按主键构建 map，便于匹配
+	sourceMap := make(map[string]map[string]interface{})
+	targetMap := make(map[string]map[string]interface{})
+
+	for _, row := range sourceData {
+		key := buildKey(row, pkCols)
+		sourceMap[key] = row
+	}
+	for _, row := range targetData {
+		key := buildKey(row, pkCols)
+		targetMap[key] = row
+	}
+
+	// 第四步：按主键匹配比对
+	// 查找修改的记录（两边都存在）
+	for key, srcRow := range sourceMap {
+		if tgtRow, exists := targetMap[key]; exists {
+			// 逐字段比对
+			changes := compareRow(srcRow, tgtRow, columns)
 			if len(changes) > 0 {
 				diff.Modified = append(diff.Modified, DataModification{
-					Key:     fmt.Sprintf("row_%d", i),
-					Source:  sourceData[i],
-					Target:  targetData[i],
+					Key:     key,
+					Source:  srcRow,
+					Target:  tgtRow,
 					Changes: changes,
 				})
 			}
+		} else {
+			// 源库有，目标库没有 -> 删除
+			diff.Removed = append(diff.Removed, srcRow)
+		}
+	}
+
+	// 查找新增的记录（目标库有，源库没有）
+	for key, tgtRow := range targetMap {
+		if _, exists := sourceMap[key]; !exists {
+			diff.Added = append(diff.Added, tgtRow)
 		}
 	}
 
 	return diff, nil
+}
+
+// fetchSamplePrimaryKeys 随机抽取 N 条主键值
+func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limit int) ([]interface{}, error) {
+	query := fmt.Sprintf("SELECT `%s` FROM `%s` ORDER BY RAND() LIMIT %d", pkCol, table, limit)
+	rows, err := conn.DB.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var pkValues []interface{}
+	for rows.Next() {
+		var pk interface{}
+		if err := rows.Scan(&pk); err != nil {
+			return nil, err
+		}
+		pkValues = append(pkValues, pk)
+	}
+
+	return pkValues, rows.Err()
+}
+
+// fetchTableDataByPrimaryKeys 按主键列表查询完整数据
+func fetchTableDataByPrimaryKeys(conn *database.Connection, table string, columns []database.ColumnMeta, pkCol string, pkValues []interface{}) ([]map[string]interface{}, error) {
+	if len(pkValues) == 0 {
+		return []map[string]interface{}{}, nil
+	}
+
+	// 构建 WHERE pk IN (?, ?, ...) 子句
+	placeholders := make([]string, len(pkValues))
+	args := make([]interface{}, len(pkValues))
+	for i, pk := range pkValues {
+		placeholders[i] = "?"
+		args[i] = pk
+	}
+	whereClause := fmt.Sprintf("`%s` IN (%s)", pkCol, strings.Join(placeholders, ", "))
+
+	// 构建 SELECT 子句
+	colNames := make([]string, len(columns))
+	for i, c := range columns {
+		colNames[i] = fmt.Sprintf("`%s`", c.Name)
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM `%s` WHERE %s", strings.Join(colNames, ", "), table, whereClause)
+	rows, err := conn.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols, _ := rows.Columns()
+	values := make([]interface{}, len(cols))
+	valuePtrs := make([]interface{}, len(cols))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	var data []map[string]interface{}
+	for rows.Next() {
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return nil, err
+		}
+		row := make(map[string]interface{}, len(cols))
+		for i, col := range cols {
+			row[col] = values[i]
+		}
+		data = append(data, row)
+	}
+
+	return data, rows.Err()
 }
 
 // getPrimaryKeyColumns 获取主键列（必须有主键或唯一索引）
