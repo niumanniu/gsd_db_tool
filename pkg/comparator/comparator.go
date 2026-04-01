@@ -554,6 +554,11 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 		fmt.Printf("\n[%s] 开始比对，共 %d 条记录...\n", table, totalCount)
 	}
 
+	// 全局的 map 用于累积未匹配的记录
+	// 只有在确认某个主键在另一个表中不存在时，才从 remaining map 中移除并标记为"删除"或"新增"
+	sourceRemaining := make(map[string]map[string]interface{})
+	targetRemaining := make(map[string]map[string]interface{})
+
 	for {
 		var sourceBatch, targetBatch []map[string]interface{}
 		var sourceNext, targetNext []interface{}
@@ -595,10 +600,10 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 				sourceBatchHash == targetBatchHash &&
 				len(sourceBatch) == len(targetBatch) {
 				// 整批数据一致，跳过 - 但仍需更新 currentKey
-				// 确定下一批的起始键
+				// 确定下一批的起始键：选择较小的 nextKey，确保不会遗漏记录
 				var nextKey interface{}
 				if sourceNext != nil && targetNext != nil {
-					if sourceNext[0].(int64) > targetNext[0].(int64) {
+					if sourceNext[0].(int64) < targetNext[0].(int64) {
 						nextKey = sourceNext[0]
 					} else {
 						nextKey = targetNext[0]
@@ -641,14 +646,13 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 			fmt.Printf("\r[%s] 进度：%.1f%% (%d/%d), 已耗时 %v", table, progress, processedCount, totalCount, elapsed)
 		}
 
-		// 构建索引比对
-		sourceMap := make(map[string]map[string]interface{})
+		// 构建当前批次的 map，并与上一批剩余的记录合并
+		sourceMap := sourceRemaining
+		targetMap := targetRemaining
 		for _, row := range sourceBatch {
 			key := buildKey(row, pkCols)
 			sourceMap[key] = row
 		}
-
-		targetMap := make(map[string]map[string]interface{})
 		for _, row := range targetBatch {
 			key := buildKey(row, pkCols)
 			targetMap[key] = row
@@ -689,29 +693,39 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 				delete(targetMap, key)
 			}
 		}
-		for _, srcRow := range sourceMap {
-			diff.Removed = append(diff.Removed, srcRow)
-		}
-		for _, tgtRow := range targetMap {
-			diff.Added = append(diff.Added, tgtRow)
-		}
 
 		// 确定下一批的起始键
+		// 注意：选择较小的 nextKey，确保不会遗漏任何记录
+		// 重复处理的记录会在之前的批次中被 delete，不会造成重复报告
 		var nextKey interface{}
 		if sourceNext != nil && targetNext != nil {
-			if sourceNext[0].(int64) > targetNext[0].(int64) {
+			if sourceNext[0].(int64) < targetNext[0].(int64) {
 				nextKey = sourceNext[0]
 			} else {
 				nextKey = targetNext[0]
 			}
 		} else if sourceNext != nil {
+			// 目标表没有更多数据，但源表还有
+			// 需要继续处理源表剩余的记录
 			nextKey = sourceNext[0]
 		} else if targetNext != nil {
+			// 源表没有更多数据，但目标表还有
+			// 需要继续处理目标表剩余的记录
 			nextKey = targetNext[0]
 		} else {
+			// 两个表都没有更多数据，处理剩余记录
 			break
 		}
 		currentKey = nextKey
+	}
+
+	// 循环结束后，处理最后剩余的记录
+	// 此时 sourceRemaining 和 targetRemaining 中的记录才是真正的"删除"和"新增"
+	for _, srcRow := range sourceRemaining {
+		diff.Removed = append(diff.Removed, srcRow)
+	}
+	for _, tgtRow := range targetRemaining {
+		diff.Added = append(diff.Added, tgtRow)
 	}
 
 	if cfg.ShowProgress {
@@ -816,14 +830,14 @@ func fetchDataByKeyRange(conn *database.Connection, table string, columns []data
 
 // fetchMySQLDataWithHash 按主键范围分批获取数据（带 SQL 层 hash 计算，仅 MySQL）
 // 返回每行数据（含单行 hash）和整批数据的聚合 hash
+// 使用 MD5(GROUP_CONCAT(CONCAT_WS('|', col1, col2, ...) ORDER BY pk)) 计算整批 hash
 func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []database.ColumnMeta, hashColumns []database.ColumnMeta, pkCol string, startKey interface{}, limit int) ([]map[string]interface{}, []interface{}, string, error) {
-	// 构建单行 hash 表达式：CRC32(CONCAT(...))
+	// 构建单行 hash 表达式：CRC32(CONCAT(...)) - 用于行级快速对比
 	rowHashExpr := "CRC32(CONCAT("
 	for i, c := range hashColumns {
 		if i > 0 {
 			rowHashExpr += `,';',`
 		}
-		// 处理不同类型
 		switch c.DataType {
 		case "int", "integer", "bigint", "smallint", "tinyint", "mediumint":
 			rowHashExpr += fmt.Sprintf("IFNULL(`%s`,'')", c.Name)
@@ -837,12 +851,32 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 	}
 	rowHashExpr += "))"
 
-	// 构建 SELECT 子句 - 先只查询数据列和单行 hash
+	// 构建整批聚合 hash 表达式：MD5(GROUP_CONCAT(CONCAT_WS('|', col1, col2, ...) ORDER BY pk))
+	// 使用 CONCAT_WS 避免 'ab','c' 和 'a','bc' 产生相同结果的问题
+	batchHashExpr := "MD5(GROUP_CONCAT(CONCAT_WS("
+	for i, c := range hashColumns {
+		if i > 0 {
+			batchHashExpr += ",'"
+		}
+		switch c.DataType {
+		case "int", "integer", "bigint", "smallint", "tinyint", "mediumint":
+			batchHashExpr += fmt.Sprintf("'|', IFNULL(`%s`,'')", c.Name)
+		case "decimal", "numeric", "float", "double":
+			batchHashExpr += fmt.Sprintf("'|', IFNULL(CAST(`%s` AS CHAR),'')", c.Name)
+		case "datetime", "timestamp", "date", "time":
+			batchHashExpr += fmt.Sprintf("'|', IFNULL(DATE_FORMAT(`%s`,'%%Y-%%m-%%d %%H:%%i:%%s'),'')", c.Name)
+		default:
+			batchHashExpr += fmt.Sprintf("'|', IFNULL(`%s`,'')", c.Name)
+		}
+	}
+	batchHashExpr += fmt.Sprintf(") ORDER BY `%s`)) AS batch_hash", pkCol)
+
+	// 构建 SELECT 子句 - 数据列 + 单行 hash + 整批 hash
 	colNames := make([]string, len(columns))
 	for i, c := range columns {
 		colNames[i] = fmt.Sprintf("`%s`", c.Name)
 	}
-	selectClause := fmt.Sprintf("%s, %s AS row_hash", strings.Join(colNames, ", "), rowHashExpr)
+	selectClause := fmt.Sprintf("%s, %s AS row_hash, %s", strings.Join(colNames, ", "), rowHashExpr, batchHashExpr)
 
 	// 构建查询
 	whereClause := ""
@@ -853,7 +887,7 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 	}
 
 	query := fmt.Sprintf("SELECT %s FROM `%s` %s ORDER BY `%s` LIMIT ?", selectClause, table, whereClause, pkCol)
-	args = append(args, limit+1) // 多取一行用于判断是否有下一页
+	args = append(args, limit+1)
 
 	rows, err := conn.DB.Query(query, args...)
 	if err != nil {
@@ -861,7 +895,7 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 	}
 	defer rows.Close()
 
-	// 获取列名（包含 row_hash）
+	// 获取列名
 	cols, _ := rows.Columns()
 	values := make([]interface{}, len(cols))
 	valuePtrs := make([]interface{}, len(cols))
@@ -871,7 +905,7 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 
 	var data []map[string]interface{}
 	var nextKey []interface{}
-	var batchHash uint64 = 0
+	var batchHash string
 	count := 0
 
 	for rows.Next() {
@@ -882,12 +916,12 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 		for i, col := range cols {
 			colLower := strings.ToLower(col)
 			if colLower == "row_hash" {
-				// 将单行 hash 值存入特殊字段，并累加到批 hash
 				hashVal := values[i]
 				row["__row_hash__"] = hashVal
-				// CRC32 返回 uint64，累加到批 hash
-				if h, ok := hashVal.(int64); ok {
-					batchHash += uint64(h)
+			} else if colLower == "batch_hash" {
+				// 整批 hash，每行都返回相同值，取第一个即可
+				if batchHash == "" {
+					batchHash = fmt.Sprintf("%v", values[i])
 				}
 			} else {
 				row[col] = values[i]
@@ -901,7 +935,7 @@ func fetchMySQLDataWithHash(conn *database.Connection, table string, columns []d
 		count++
 	}
 
-	return data, nextKey, fmt.Sprintf("%d", batchHash), rows.Err()
+	return data, nextKey, batchHash, rows.Err()
 }
 
 // compareTableDataSample 抽样数据对比
