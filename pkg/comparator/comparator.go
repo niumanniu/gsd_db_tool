@@ -486,7 +486,11 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 		return diff, fmt.Errorf("表 %s 没有可对比的字段（可能被全部排除）", table)
 	}
 
-	const batchSize = 1000
+	// 使用配置的批次大小，默认值 1000
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 1000
+	}
 	pkColName := pkCols[0]
 
 	// 获取源表主键范围

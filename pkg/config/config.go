@@ -28,6 +28,7 @@ type CompareOptions struct {
 	IncludeColumns  []string `yaml:"include_columns"`   // 只比对的字段列表，空表示所有字段
 	ExcludeColumns  []string `yaml:"exclude_columns"`   // 跳过比对的字段列表
 	HashFilter      bool     `yaml:"hash_filter"`       // 是否启用 hash 预筛选（提高大宽表性能）
+	BatchSize       int      `yaml:"batch_size"`        // 数据比对批次大小（每批读取的行数）
 	ShowFullData    bool     `yaml:"show_full_data"`    // 是否显示完整数据（源数据和目标数据）
 	ShowProgress    bool     `yaml:"show_progress"`     // 是否显示进度和耗时
 }
