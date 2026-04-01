@@ -711,10 +711,10 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 				targetProgress := float64(processedTarget) / float64(totalTarget) * 100
 				avgProgress := (sourceProgress + targetProgress) / 2
 				elapsed := time.Since(startTime)
-				fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %v",
+				fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %.1fs",
 					table,
 					avgProgress,
-					elapsed)
+					elapsed.Seconds())
 			}
 			continue
 		}
@@ -733,10 +733,10 @@ func compareTableDataFull(sourceConn, targetConn *database.Connection, table str
 			targetProgress := float64(processedTarget) / float64(totalTarget) * 100
 			avgProgress := (sourceProgress + targetProgress) / 2
 			elapsed := time.Since(startTime)
-			fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %v",
+			fmt.Printf("\r[%s] 进度：%.1f%%, 已耗时 %.1fs",
 				table,
 				avgProgress,
-				elapsed)
+				elapsed.Seconds())
 		}
 
 		// 构建当前批次的 map，并与上一批剩余的记录合并
