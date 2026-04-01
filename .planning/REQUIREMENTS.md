@@ -39,17 +39,17 @@
 - [x] **V2-01**: Oracle 数据库支持 — 支持 Oracle 9i/10g/11g/12c/19c 连接，使用 USER_* 视图获取元数据，支持 schema 参数
 - [x] **V2-02**: 跨数据库对比（MySQL ↔ Oracle）— 支持 MySQL ↔ Oracle 双向对比，智能类型映射与警告标记，报告显示类型兼容状态
 
-## v2.1 Requirements (Active)
+## v2.1 Requirements (Complete ✓)
 
 ### 性能优化
-- [ ] **PERF-01**: 并行查询优化 — 将源和目标数据库的查询操作改为并行执行，减少总体等待时间
+- [x] **PERF-01**: 并行查询优化 — 将源和目标数据库的查询操作改为并行执行，减少总体等待时间
 
 **Acceptance Criteria:**
-1. 使用 goroutine + channel 或 errgroup 实现并发查询
-2. 源表和目标表的批次数据读取同时发起
-3. 等待两个查询都完成后再进行比对
-4. 错误处理正确，任一查询失败时另一个查询被取消
-5. 性能提升可测量（网络延迟 100ms 场景下，期望 ~50% 时间减少）
+1. ✓ 使用 goroutine + channel 或 errgroup 实现并发查询
+2. ✓ 源表和目标表的批次数据读取同时发起
+3. ✓ 等待两个查询都完成后再进行比对
+4. ✓ 错误处理正确，任一查询失败时另一个查询被取消
+5. ✓ 性能提升可测量（网络延迟 100ms 场景下，期望 ~50% 时间减少）
 
 **Out of Scope:**
 - 不改变批次比对算法逻辑
@@ -86,8 +86,8 @@
 | Oracle 支持 | 1 | ✓ |
 | 跨数据库对比 | 1 | ✓ |
 
-**v2.1: 0/1 requirements complete**
+**v2.1: 1/1 requirements complete** ✓
 
 | Category | Requirements | Status |
 |----------|-------------|--------|
-| 性能优化 | 1 | Pending |
+| 性能优化 | 1 | ✓ |
