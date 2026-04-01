@@ -66,7 +66,7 @@
 
 ## Phase 5: 并行查询优化
 
-**Status:** Pending
+**Status:** Planned
 
 **Goal:** 将源和目标数据库的查询操作改为并行执行，提升比对速度
 
@@ -79,7 +79,10 @@
 - 错误处理正确，任一查询失败时另一个查询被取消
 - 性能提升可测量（网络延迟 100ms 场景下，期望 ~50% 时间减少）
 
-**Plans:** 0/1 complete
+**Plans:** 1 plan
+
+Plans:
+- [ ] 05-01-PLAN.md — Refactor compareTableDataFull to use parallel goroutines for batch queries with context cancellation, timing instrumentation, and dual progress display
 
 ---
 
