@@ -1089,8 +1089,8 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 		fmt.Printf("\r[%s] 开始抽样比对，抽样比例 %.1f%%，样本数 %d\n", table, cfg.SampleRatio*100, sampleSize)
 	}
 
-	// 第一步：从源库随机抽取 N 条记录的主键
-	sourcePKs, err := fetchSamplePrimaryKeys(sourceConn, table, pkCols[0], sampleSize)
+	// 第一步：从源库随机抽取 N 条记录的主键（传入 totalCount 避免重复查询）
+	sourcePKs, err := fetchSamplePrimaryKeys(sourceConn, table, pkCols[0], sampleSize, totalCount)
 	if err != nil {
 		return diff, err
 	}
@@ -1163,8 +1163,8 @@ func compareTableDataSample(sourceConn, targetConn *database.Connection, table s
 }
 
 // fetchSamplePrimaryKeys 随机抽取 N 条主键值
-// 优化：避免 ORDER BY RAND() 全表扫描，使用主键范围 + 随机偏移
-func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limit int) ([]interface{}, error) {
+// 优化：使用传入的 totalCount，避免重复 COUNT(*) 查询
+func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limit int, totalCount int64) ([]interface{}, error) {
 	// 第一步：获取主键范围（使用索引，效率高）
 	var minVal, maxVal interface{}
 	row := conn.DB.QueryRow(fmt.Sprintf("SELECT MIN(`%s`), MAX(`%s`) FROM `%s`", pkCol, pkCol, table))
@@ -1172,11 +1172,6 @@ func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limi
 	if err != nil || minVal == nil || maxVal == nil {
 		return []interface{}{}, nil // 空表
 	}
-
-	// 第二步：获取总记录数（用于评估抽样比例）
-	var totalCount int64
-	row = conn.DB.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM `%s`", table))
-	row.Scan(&totalCount)
 
 	// 如果记录数小于等于 limit，直接返回所有主键
 	if totalCount <= int64(limit) {
@@ -1198,9 +1193,8 @@ func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limi
 		return pkValues, rows.Err()
 	}
 
-	// 第三步：使用随机偏移 + 主键索引的方式抽取主键
-	// 对于大表，使用多个随机起点，每个起点取少量数据，降低聚集性
-	pkValues, err := fetchSamplePrimaryKeysByRandomOffset(conn, table, pkCol, limit, minVal, maxVal)
+	// 使用系统抽样 + 随机起点方式抽取主键
+	pkValues, err := fetchSamplePrimaryKeysSystematic(conn, table, pkCol, limit, minVal, maxVal, totalCount)
 	if err != nil {
 		return nil, err
 	}
@@ -1213,11 +1207,12 @@ func fetchSamplePrimaryKeys(conn *database.Connection, table, pkCol string, limi
 	return pkValues, nil
 }
 
-// fetchSamplePrimaryKeysByRandomOffset 使用随机偏移方式抽样主键
-func fetchSamplePrimaryKeysByRandomOffset(conn *database.Connection, table, pkCol string, limit int, minVal, maxVal interface{}) ([]interface{}, error) {
+// fetchSamplePrimaryKeysSystematic 系统抽样 + 随机起点
+// 算法：计算抽样间隔，使用随机起点，等间隔抽取
+func fetchSamplePrimaryKeysSystematic(conn *database.Connection, table, pkCol string, limit int, minVal, maxVal interface{}, totalCount int64) ([]interface{}, error) {
 	var pkValues []interface{}
 
-	// 计算抽样间隔，将抽样分散到整个表中
+	// 计算抽样间隔
 	sampleGap := 1
 	if maxValInt, ok := toInt64(maxVal); ok {
 		if minValInt, ok := toInt64(minVal); ok {
@@ -1232,13 +1227,16 @@ func fetchSamplePrimaryKeysByRandomOffset(conn *database.Connection, table, pkCo
 	}
 
 	// 随机起点
-	randomOffset := rand.Intn(sampleGap)
+	randomOffset := 0
+	if sampleGap > 1 {
+		randomOffset = rand.Intn(sampleGap)
+	}
 
-	// 使用主键范围查询，每次取一个批次
-	// 查询：WHERE pk >= start ORDER BY pk LIMIT sampleGap * batchCount
-	batchSize := limit * sampleGap * 2 // 放大批次，确保能取到足够数据
-	if batchSize > 10000 {
-		batchSize = 10000 // 限制最大批次大小
+	// 使用主键范围查询，限制批次大小
+	// 优化：batchSize = limit * 2，避免扫描过多数据
+	batchSize := limit * 2
+	if batchSize > 5000 {
+		batchSize = 5000
 	}
 
 	query := fmt.Sprintf("SELECT `%s` FROM `%s` WHERE `%s` >= ? ORDER BY `%s` LIMIT %d",
@@ -1251,16 +1249,21 @@ func fetchSamplePrimaryKeysByRandomOffset(conn *database.Connection, table, pkCo
 	}
 	defer rows.Close()
 
+	// 等间隔抽取：每 gap 行取 1 行
 	count := 0
+	skipped := 0
 	for rows.Next() && count < limit {
 		var pk interface{}
 		if err := rows.Scan(&pk); err != nil {
 			return nil, err
 		}
-		// 简单的随机跳过，模拟随机抽样
-		if rand.Intn(sampleGap) == 0 || count < limit {
+		// 简单等间隔抽样
+		if sampleGap <= 1 || skipped >= sampleGap-1 {
 			pkValues = append(pkValues, pk)
 			count++
+			skipped = 0
+		} else {
+			skipped++
 		}
 	}
 
